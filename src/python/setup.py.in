@@ -22,7 +22,7 @@ src_python_native = os.path.join('src', 'python', 'native')
 protobuf = os.path.join('third_party', 'protobuf-2.4.1')
 glog = os.path.join('third_party', 'glog-0.3.2')
 leveldb = os.path.join('third_party', 'leveldb')
-zookeeper = os.path.join('third_party', 'zookeeper-3.3.4', 'src', 'c')
+zookeeper = os.path.join('third_party', 'zookeeper-3.4.5', 'src', 'c')
 libprocess = os.path.join('third_party', 'libprocess')
 
 # Even though a statically compiled libprocess should include libev,
