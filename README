@@ -17,6 +17,11 @@ Alternatively (and recommended), use a remote build directory:
   $ make check
   $ make install
 
+Configurating for Clang:
+  $ CC=clang CXX=clang++ \
+    CXXFLAGS='-DBOOST_CLANG=1 -DBOOST_CB_DISABLE_DEBUG=1 ' \
+    ../configure
+
 If you can't seem to find configure then you probably downloaded the
 source, you'll need to "bootstrap" your development environment with:
 
