@@ -145,7 +145,7 @@ SlaveID readSlaveID(const string& rootDir)
 
   if (!result.isSome()) {
     LOG(WARNING) << "Cannot read slave id from " << path << " because "
-                 << result.isError() ? result.error() : "empty";
+                 << (result.isError() ? result.error() : "empty");
     return slaveId;
   }
 
@@ -188,7 +188,7 @@ process::UPID readFrameworkPID(const string& metaRootDir,
 
   if (!result.isSome()) {
     LOG(WARNING) << "Cannot read framework pid from " << path << " because "
-                 << result.isError() ? result.error() : "empty";
+                 << (result.isError() ? result.error() : "empty");
     return process::UPID();
   }
 

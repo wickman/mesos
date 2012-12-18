@@ -52,6 +52,8 @@ class Master; // Forward declaration.
 class AllocatorProcess : public process::Process<AllocatorProcess>
 {
 public:
+  using process::Process<AllocatorProcess>::initialize;
+
   AllocatorProcess() {}
 
   virtual ~AllocatorProcess() {}

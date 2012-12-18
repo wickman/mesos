@@ -40,6 +40,8 @@ class ProcessBasedIsolationModule
   : public IsolationModule, public ProcessExitedListener
 {
 public:
+  using IsolationModule::initialize;
+
   ProcessBasedIsolationModule();
 
   virtual ~ProcessBasedIsolationModule();

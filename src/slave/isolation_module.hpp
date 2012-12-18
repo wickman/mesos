@@ -40,6 +40,8 @@ class Slave;
 class IsolationModule : public process::Process<IsolationModule>
 {
 public:
+  using process::Process<IsolationModule>::initialize;
+
   static IsolationModule* create(const std::string& type);
   static void destroy(IsolationModule* module);
 
