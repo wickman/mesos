@@ -1156,7 +1156,7 @@ balloon_executor_LDADD = libmesos.la
 check_PROGRAMS += pong-process
 pong_process_SOURCES = examples/pong_process.cpp
 pong_process_CPPFLAGS = $(MESOS_CPPFLAGS)
-pong_process_LDADD = libmesos.la
+pong_process_LDADD = ../$(LIBPROCESS)/libprocess.la
 
 check_PROGRAMS += load-generator-framework
 load_generator_framework_SOURCES = examples/load_generator_framework.cpp
