@@ -7,6 +7,7 @@
 #include <map>
 #include <queue>
 
+#include <process/address.hpp>
 #include <process/clock.hpp>
 #include <process/event.hpp>
 #include <process/filter.hpp>
@@ -121,13 +122,13 @@ protected:
   HttpRequestHandler;
 
   // Setup a handler for an HTTP request.
-  bool route(
+  void route(
       const std::string& name,
       const Option<std::string>& help,
       const HttpRequestHandler& handler);
 
   template <typename T>
-  bool route(
+  void route(
       const std::string& name,
       const Option<std::string>& help,
       Future<http::Response> (T::*method)(const http::Request&))
@@ -137,7 +138,7 @@ protected:
     // multiple callback interfaces).
     HttpRequestHandler handler =
       lambda::bind(method, dynamic_cast<T*>(this), lambda::_1);
-    return route(name, help, handler);
+    route(name, help, handler);
   }
 
   // Provide the static asset(s) at the specified _absolute_ path for
@@ -276,16 +277,9 @@ void finalize();
 
 
 /**
- * Returns the IP address associated with this instance of the
- * library.
+ * Returns the socket address associated with this instance of the library.
  */
-uint32_t ip();
-
-
-/**
- * Returns the port associated with this instance of the library.
- */
-uint16_t port();
+network::Address address();
 
 
 /**

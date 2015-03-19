@@ -20,6 +20,8 @@
 
 #include <algorithm>
 
+#include <mesos/type_utils.hpp>
+
 #include <process/dispatch.hpp>
 #include <process/id.hpp>
 
@@ -31,8 +33,6 @@
 #include <stout/result.hpp>
 #include <stout/try.hpp>
 #include <stout/utils.hpp>
-
-#include "common/type_utils.hpp"
 
 #include "log/leveldb.hpp"
 #include "log/replica.hpp"
@@ -221,6 +221,9 @@ Future<list<Action> > ReplicaProcess::read(uint64_t from, uint64_t to)
     promise.fail("Bad read range (past end of log)");
     return promise.future();
   }
+
+  VLOG(2) << "Starting read from '" << stringify(from) << "' to '"
+          << stringify(to) << "'";
 
   list<Action> actions;
 

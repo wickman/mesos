@@ -7,6 +7,9 @@
 #include <sstream>
 #include <string>
 
+#include <process/address.hpp>
+
+#include <stout/ip.hpp>
 
 namespace process {
 
@@ -16,17 +19,22 @@ class ProcessBase;
 
 struct UPID
 {
-  UPID()
-    : ip(0), port(0) {}
+  UPID() = default;
 
   UPID(const UPID& that)
-    : id(that.id), ip(that.ip), port(that.port) {}
+    : id(that.id), address(that.address) {}
 
-  UPID(const char* id_, uint32_t ip_, uint16_t port_)
-    : id(id_), ip(ip_), port(port_) {}
+  UPID(const char* id_, const net::IP& ip_, uint16_t port_)
+    : id(id_), address(ip_, port_) {}
 
-  UPID(const std::string& id_, uint32_t ip_, uint16_t port_)
-    : id(id_), ip(ip_), port(port_) {}
+  UPID(const char* id_, const network::Address& address_)
+    : id(id_), address(address_) {}
+
+  UPID(const std::string& id_, const net::IP& ip_, uint16_t port_)
+    : id(id_), address(ip_, port_) {}
+
+  UPID(const std::string& id_, const network::Address& address_)
+    : id(id_), address(address_) {}
 
   /*implicit*/ UPID(const char* s);
 
@@ -38,47 +46,35 @@ struct UPID
 
   operator bool () const
   {
-    return id != "" && ip != 0 && port != 0;
+    return id != "" && !address.ip.isAny() && address.port != 0;
   }
 
   bool operator ! () const // NOLINT(whitespace/operators)
   {
-    return id == "" && ip == 0 && port == 0;
+    return id == "" && address.ip.isAny() && address.port == 0;
   }
 
   bool operator < (const UPID& that) const
   {
-    if (this != &that) {
-      if (ip == that.ip && port == that.port)
-        return id < that.id;
-      else if (ip == that.ip && port != that.port)
-        return port < that.port;
-      else
-        return ip < that.ip;
+    if (address == that.address) {
+      return id < that.id;
+    } else {
+      return address < that.address;
     }
-
-    return false;
   }
 
   bool operator == (const UPID& that) const
   {
-    if (this != &that) {
-      return (id == that.id &&
-              ip == that.ip &&
-              port == that.port);
-    }
-
-    return true;
+    return (id == that.id && address == that.address);
   }
 
   bool operator != (const UPID& that) const
   {
-    return !(this->operator == (that));
+    return !(*this == that);
   }
 
   std::string id;
-  uint32_t ip;
-  uint16_t port;
+  network::Address address;
 };
 
 
@@ -99,8 +95,7 @@ struct PID : UPID
     (void)base;  // Eliminate unused base warning.
     PID<Base> pid;
     pid.id = id;
-    pid.ip = ip;
-    pid.port = port;
+    pid.address = address;
     return pid;
   }
 };
@@ -115,7 +110,5 @@ std::istream& operator >> (std::istream&, UPID&);
 std::size_t hash_value(const UPID&);
 
 }  // namespace process {
-
-
 
 #endif // __PROCESS_PID_HPP__

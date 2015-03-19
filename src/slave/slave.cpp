@@ -29,6 +29,10 @@
 #include <string>
 #include <vector>
 
+#include <mesos/type_utils.hpp>
+
+#include <mesos/module/authenticatee.hpp>
+
 #include <process/async.hpp>
 #include <process/check.hpp>
 #include <process/defer.hpp>
@@ -36,8 +40,6 @@
 #include <process/dispatch.hpp>
 #include <process/id.hpp>
 #include <process/time.hpp>
-
-#include <process/metrics/metrics.hpp>
 
 #include <stout/bytes.hpp>
 #include <stout/check.hpp>
@@ -66,12 +68,16 @@
 
 #include "common/build.hpp"
 #include "common/protobuf_utils.hpp"
-#include "common/type_utils.hpp"
+#include "common/resources_utils.hpp"
 #include "common/status_utils.hpp"
 
 #include "credentials/credentials.hpp"
 
+#include "hook/manager.hpp"
+
 #include "logging/logging.hpp"
+
+#include "module/manager.hpp"
 
 #include "slave/constants.hpp"
 #include "slave/flags.hpp"
@@ -124,7 +130,8 @@ Slave::Slave(const slave::Flags& _flags,
     authenticatee(NULL),
     authenticating(None()),
     authenticated(false),
-    reauthenticate(false) {}
+    reauthenticate(false),
+    executorDirectoryMaxAllowedAge(age(0)) {}
 
 
 Slave::~Slave()
@@ -168,7 +175,7 @@ void Slave::initialize()
 {
   LOG(INFO) << "Slave started on " << string(self()).substr(6);
 
-  if (stringify(net::IP(ntohl(self().ip))) == "127.0.0.1") {
+  if (self().address.ip.isLoopback()) {
     LOG(WARNING) << "\n**************************************************\n"
                  << "Slave bound to loopback interface!"
                  << " Cannot communicate with remote master(s)."
@@ -261,21 +268,26 @@ void Slave::initialize()
             << "Must be less than " << REGISTER_RETRY_INTERVAL_MAX;
   }
 
-  if (flags.credential.isSome()) {
-    const string& path =
-      strings::remove(flags.credential.get(), "file://", strings::PREFIX);
+  authenticateeName = flags.authenticatee;
 
-    Result<Credential> _credential = credentials::readCredential(path);
+  if (flags.credential.isSome()) {
+    Result<Credential> _credential =
+      credentials::readCredential(flags.credential.get());
     if (_credential.isError()) {
       EXIT(1) << _credential.error() << " (see --credential flag)";
     } else if (_credential.isNone()) {
-      EXIT(1) << "Empty credential file '" << path
+      EXIT(1) << "Empty credential file '" << flags.credential.get()
               << "' (see --credential flag)";
     } else {
       credential = _credential.get();
       LOG(INFO) << "Slave using credential for: "
                 << credential.get().principal();
     }
+  }
+
+  if ((flags.gc_disk_headroom < 0) || (flags.gc_disk_headroom > 1)) {
+    EXIT(1) << "Invalid value '" << flags.gc_disk_headroom
+            << "' for --gc_disk_headroom. Must be between 0.0 and 1.0.";
   }
 
   // Ensure slave work directory exists.
@@ -297,7 +309,7 @@ void Slave::initialize()
   string hostname;
 
   if (flags.hostname.isNone()) {
-    Try<string> result = net::getHostname(self().ip);
+    Try<string> result = net::getHostname(self().address.ip);
 
     if (result.isError()) {
       LOG(FATAL) << "Failed to get hostname: " << result.error();
@@ -310,7 +322,7 @@ void Slave::initialize()
 
   // Initialize slave info.
   info.set_hostname(hostname);
-  info.set_port(self().port);
+  info.set_port(self().address.port);
   info.mutable_resources()->CopyFrom(resources.get());
   info.mutable_attributes()->CopyFrom(attributes);
   info.set_checkpoint(flags.checkpoint);
@@ -330,19 +342,6 @@ void Slave::initialize()
   // checkDiskUsage, to make disabling this feature easy (e.g by specifying
   // a very large disk_watch_interval).
   delay(flags.disk_watch_interval, self(), &Slave::checkDiskUsage);
-
-  // Start all the statistics at 0.
-  stats.tasks[TASK_STAGING] = 0;
-  stats.tasks[TASK_STARTING] = 0;
-  stats.tasks[TASK_RUNNING] = 0;
-  stats.tasks[TASK_FINISHED] = 0;
-  stats.tasks[TASK_FAILED] = 0;
-  stats.tasks[TASK_KILLED] = 0;
-  stats.tasks[TASK_LOST] = 0;
-  stats.validStatusUpdates = 0;
-  stats.invalidStatusUpdates = 0;
-  stats.validFrameworkMessages = 0;
-  stats.invalidFrameworkMessages = 0;
 
   startTime = Clock::now();
 
@@ -383,6 +382,10 @@ void Slave::initialize()
       &Slave::updateFramework,
       &UpdateFrameworkMessage::framework_id,
       &UpdateFrameworkMessage::pid);
+
+  install<CheckpointResourcesMessage>(
+      &Slave::checkpointResources,
+      &CheckpointResourcesMessage::resources);
 
   install<StatusUpdateAcknowledgementMessage>(
       &Slave::statusUpdateAcknowledgement,
@@ -432,10 +435,17 @@ void Slave::initialize()
   route("/health",
         Http::HEALTH_HELP,
         lambda::bind(&Http::health, http, lambda::_1));
-  route("/stats.json", None(), lambda::bind(&Http::stats, http, lambda::_1));
   route("/state.json", None(), lambda::bind(&Http::state, http, lambda::_1));
 
-  if (flags.log_dir.isSome()) {
+  // Expose the log file for the webui. Fall back to 'log_dir' if
+  // an explicit file was not specified.
+  if (flags.external_log_file.isSome()) {
+    files->attach(flags.external_log_file.get(), "/slave/log")
+      .onAny(defer(self(),
+                   &Self::fileAttached,
+                   lambda::_1,
+                   flags.external_log_file.get()));
+  } else if (flags.log_dir.isSome()) {
     Try<string> log = logging::getLogFile(
         logging::getLogSeverity(flags.logging_level));
 
@@ -664,13 +674,27 @@ void Slave::authenticate()
 
   LOG(INFO) << "Authenticating with master " << master.get();
 
+  CHECK(authenticatee == NULL);
+
+  if (authenticateeName == DEFAULT_AUTHENTICATEE) {
+    LOG(INFO) << "Using default CRAM-MD5 authenticatee";
+    authenticatee = new cram_md5::CRAMMD5Authenticatee();
+  } else {
+    Try<Authenticatee*> module =
+      modules::ModuleManager::create<Authenticatee>(authenticateeName);
+    if (module.isError()) {
+      EXIT(1) << "Could not create authenticatee module '"
+              << authenticateeName << "': " << module.error();
+    }
+    LOG(INFO) << "Using '" << authenticateeName << "' authenticatee";
+    authenticatee = module.get();
+  }
+
   CHECK_SOME(credential);
 
-  CHECK(authenticatee == NULL);
-  authenticatee = new cram_md5::Authenticatee(credential.get(), self());
-
-  authenticating = authenticatee->authenticate(master.get())
-    .onAny(defer(self(), &Self::_authenticate));
+  authenticating =
+    authenticatee->authenticate(master.get(), self(), credential.get())
+      .onAny(defer(self(), &Self::_authenticate));
 
   delay(Seconds(5),
         self(),
@@ -776,7 +800,7 @@ void Slave::registered(const UPID& from, const SlaveID& slaveId)
       // If we don't get a ping from the master, trigger a
       // re-registration. This needs to be done once registered,
       // in case we never receive an initial ping.
-      Timer::cancel(pingTimer);
+      Clock::cancel(pingTimer);
 
       pingTimer = delay(
           MASTER_PING_TIMEOUT(),
@@ -842,7 +866,7 @@ void Slave::reregistered(
       // https://issues.apache.org/jira/browse/MESOS-677
     default:
       LOG(FATAL) << "Unexpected slave state " << state;
-      return;;
+      return;
   }
 
   if (!(info.id() == slaveId)) {
@@ -906,7 +930,7 @@ void Slave::reregistered(
 }
 
 
-void Slave::doReliableRegistration(const Duration& duration)
+void Slave::doReliableRegistration(Duration maxBackoff)
 {
   if (master.isNone()) {
     LOG(INFO) << "Skipping registration because no master present";
@@ -937,14 +961,18 @@ void Slave::doReliableRegistration(const Duration& duration)
     message.set_version(MESOS_VERSION);
     message.mutable_slave()->CopyFrom(info);
 
+    // Include checkpointed resources.
+    message.mutable_checkpointed_resources()->CopyFrom(checkpointedResources);
+
     send(master.get(), message);
   } else {
     // Re-registering, so send tasks running.
     ReregisterSlaveMessage message;
     message.set_version(MESOS_VERSION);
 
-    // TODO(bmahler): Remove in 0.22.0.
-    message.mutable_slave_id()->CopyFrom(info.id());
+    // Include checkpointed resources.
+    message.mutable_checkpointed_resources()->CopyFrom(checkpointedResources);
+
     message.mutable_slave()->CopyFrom(info);
 
     foreachvalue (Framework* framework, frameworks) {
@@ -1040,19 +1068,17 @@ void Slave::doReliableRegistration(const Duration& duration)
     send(master.get(), message);
   }
 
-  // Retry registration if necessary.
-  Duration next = std::min(
-      duration * ((double) ::random() / RAND_MAX),
-      REGISTER_RETRY_INTERVAL_MAX);
+  // Bound the maximum backoff by 'REGISTER_RETRY_INTERVAL_MAX'.
+  maxBackoff = std::min(maxBackoff, REGISTER_RETRY_INTERVAL_MAX);
 
-  Duration duration_ = std::min(
-      duration * 2,
-      REGISTER_RETRY_INTERVAL_MAX);
+  // Determine the delay for next attempt by picking a random
+  // duration between 0 and 'maxBackoff'.
+  Duration delay = maxBackoff * ((double) ::random() / RAND_MAX);
 
-  VLOG(1) << "Will retry registration in " << next << " if necessary";
+  VLOG(1) << "Will retry registration in " << delay << " if necessary";
 
   // Backoff.
-  delay(next, self(), &Slave::doReliableRegistration, duration_);
+  process::delay(delay, self(), &Slave::doReliableRegistration, maxBackoff * 2);
 }
 
 
@@ -1257,6 +1283,31 @@ void Slave::_runTask(
     return;
   }
 
+  // NOTE: If the task or executor uses persistent volumes, the slave
+  // should already know about it. In case the slave doesn't know
+  // about them (e.g., CheckpointResourcesMessage was dropped or came
+  // out of order), we simply fail the slave to be safe.
+  Resources volumes = Resources(task.resources()).persistentVolumes();
+
+  foreach (const Resource& volume, volumes) {
+    CHECK(checkpointedResources.contains(volume))
+      << "Unknown persistent volume " << volume
+      << " for task " << task.task_id()
+      << " of framework " << frameworkId;
+  }
+
+  if (task.has_executor()) {
+    Resources volumes =
+      Resources(task.executor().resources()).persistentVolumes();
+
+    foreach (const Resource& volume, volumes) {
+      CHECK(checkpointedResources.contains(volume))
+        << "Unknown persistent volume " << volume
+        << " for executor " << task.executor().executor_id()
+        << " of framework " << frameworkId;
+    }
+  }
+
   // NOTE: The slave cannot be in 'RECOVERING' because the task would
   // have been rejected in 'runTask()' in that case.
   CHECK(state == DISCONNECTED || state == RUNNING || state == TERMINATING)
@@ -1310,8 +1361,6 @@ void Slave::_runTask(
         executor->checkpointTask(task);
       }
 
-      stats.tasks[TASK_STAGING]++;
-
       // Queue task if the executor has not yet registered.
       LOG(INFO) << "Queuing task '" << task.task_id()
                   << "' for executor " << executorId
@@ -1325,34 +1374,156 @@ void Slave::_runTask(
         executor->checkpointTask(task);
       }
 
-      stats.tasks[TASK_STAGING]++;
+      // Queue task until the containerizer is updated with new
+      // resource limits (MESOS-998).
+      LOG(INFO) << "Queuing task '" << task.task_id()
+                  << "' for executor " << executorId
+                  << " of framework '" << frameworkId;
 
-      // Add the task and send it to the executor.
-      executor->addTask(task);
+      executor->queuedTasks[task.task_id()] = task;
 
-      // Update the resources.
-      // TODO(Charles Reiss): The isolator is not guaranteed to update
-      // the resources before the executor acts on its RunTaskMessage.
-      // TODO(idownes): Wait until this completes.
-      containerizer->update(executor->containerId, executor->resources);
+      // Update the resource limits for the container. Note that the
+      // resource limits include the currently queued tasks because we
+      // want the container to have enough resources to hold the
+      // upcoming tasks.
+      Resources resources = executor->resources;
 
-      LOG(INFO) << "Sending task '" << task.task_id()
-                << "' to executor '" << executorId
-                << "' of framework " << frameworkId;
+      // TODO(jieyu): Use foreachvalue instead once LinkedHashmap
+      // supports it.
+      foreach (const TaskInfo& task, executor->queuedTasks.values()) {
+        resources += task.resources();
+      }
 
-      RunTaskMessage message;
-      message.mutable_framework()->MergeFrom(framework->info);
-      message.mutable_framework_id()->MergeFrom(framework->id);
-      message.set_pid(framework->pid);
-      message.mutable_task()->MergeFrom(task);
-      send(executor->pid, message);
+      containerizer->update(executor->containerId, resources)
+        .onAny(defer(
+            self(),
+            &Self::runTasks,
+            lambda::_1,
+            frameworkId,
+            executorId,
+            executor->containerId,
+            list<TaskInfo>({task})));
       break;
     }
     default:
-      LOG(FATAL) << " Executor '" << executor->id
+      LOG(FATAL) << "Executor '" << executor->id
                  << "' of framework " << framework->id
                  << " is in unexpected state " << executor->state;
       break;
+  }
+}
+
+
+void Slave::runTasks(
+    const Future<Nothing>& future,
+    const FrameworkID& frameworkId,
+    const ExecutorID& executorId,
+    const ContainerID& containerId,
+    const list<TaskInfo>& tasks)
+{
+  // Store all task IDs for logging.
+  vector<TaskID> taskIds;
+  foreach (const TaskInfo& task, tasks) {
+    taskIds.push_back(task.task_id());
+  }
+
+  if (!future.isReady()) {
+    LOG(ERROR) << "Failed to update resources for container " << containerId
+               << " of executor '" << executorId
+               << "' of framework " << frameworkId
+               << ", destroying container: "
+               << (future.isFailed() ? future.failure() : "discarded");
+
+    containerizer->destroy(containerId);
+    return;
+  }
+
+  Framework* framework = getFramework(frameworkId);
+  if (framework == NULL) {
+    LOG(WARNING) << "Ignoring sending queued tasks " << taskIds
+                 << " to executor '" << executorId
+                 << "' of framework " << frameworkId
+                 << " because the framework does not exist";
+    return;
+  }
+
+  // No need to send the task to the executor because the framework is
+  // being shutdown. No need to send status update for the task as
+  // well because the framework is terminating!
+  if (framework->state == Framework::TERMINATING) {
+    LOG(WARNING) << "Ignoring sending queued tasks " << taskIds
+                 << " to executor '" << executorId
+                 << "' of framework " << frameworkId
+                 << " because the framework is terminating";
+    return;
+  }
+
+  Executor* executor = framework->getExecutor(executorId);
+  if (executor == NULL) {
+    LOG(WARNING) << "Ignoring sending queued tasks " << taskIds
+                 << " to executor '" << executorId
+                 << "' of framework " << frameworkId
+                 << " because the executor does not exist";
+    return;
+  }
+
+  // This is the case where the original instance of the executor has
+  // been shutdown and a new instance is brought up. No need to send
+  // status update as well because it should have already been sent
+  // when the original instance of the executor was shutting down.
+  if (executor->containerId != containerId) {
+    LOG(WARNING) << "Ignoring sending queued tasks '" << taskIds
+                 << " to executor '" << executorId
+                 << "' of framework " << frameworkId
+                 << " because the target container " << containerId
+                 << " has exited";
+    return;
+  }
+
+  CHECK(executor->state == Executor::RUNNING ||
+        executor->state == Executor::TERMINATING ||
+        executor->state == Executor::TERMINATED)
+    << executor->state;
+
+  // No need to send the task to the executor because the executor is
+  // terminating or has been terminated. No need to send status update
+  // for the task as well because it will be properly handled by
+  // 'executorTerminated'.
+  if (executor->state != Executor::RUNNING) {
+    LOG(WARNING) << "Ignoring sending queued tasks " << taskIds
+                 << " to executor '" << executorId
+                 << "' of framework " << frameworkId
+                 << " because the executor is in "
+                 << executor->state << " state";
+    return;
+  }
+
+  foreach (const TaskInfo& task, tasks) {
+    // This is the case where the task is killed. No need to send
+    // status update because it should be handled in 'killTask'.
+    if (!executor->queuedTasks.contains(task.task_id())) {
+      LOG(WARNING) << "Ignoring sending queued task '" << task.task_id()
+                   << "' to executor '" << executorId
+                   << "' of framework " << frameworkId
+                   << " because the task has been killed";
+      continue;
+    }
+
+    executor->queuedTasks.erase(task.task_id());
+
+    // Add the task and send it to the executor.
+    executor->addTask(task);
+
+    LOG(INFO) << "Sending queued task '" << task.task_id()
+              << "' to executor '" << executor->id
+              << "' of framework " << framework->id;
+
+    RunTaskMessage message;
+    message.mutable_framework_id()->MergeFrom(framework->id);
+    message.mutable_framework()->MergeFrom(framework->info);
+    message.set_pid(framework->pid);
+    message.mutable_task()->MergeFrom(task);
+    send(executor->pid, message);
   }
 }
 
@@ -1457,9 +1628,6 @@ void Slave::killTask(
   switch (executor->state) {
     case Executor::REGISTERING: {
       // The executor hasn't registered yet.
-      // NOTE: Sending a TASK_KILLED update removes the task from
-      // Executor::queuedTasks, so that if the executor registers at
-      // a later point in time, it won't get this task.
       const StatusUpdate& update = protobuf::createStatusUpdate(
           frameworkId,
           info.id(),
@@ -1470,9 +1638,16 @@ void Slave::killTask(
           TaskStatus::REASON_EXECUTOR_UNREGISTERED,
           executor->id);
 
+      // NOTE: Sending a terminal update (TASK_KILLED) removes the
+      // task from 'executor->queuedTasks', so that if the executor
+      // registers at a later point in time, it won't get this task.
       statusUpdate(update, UPID());
 
-      // This executor no longer has any running tasks, so kill it.
+      // TODO(jieyu): Here, we kill the executor if it no longer has
+      // any task to run and has not yet registered. This is a
+      // workaround for those single task executors that do not have a
+      // proper self terminating logic when they haven't received the
+      // task within a timeout.
       if (executor->queuedTasks.empty()) {
         CHECK(executor->launchedTasks.empty())
             << " Unregistered executor " << executor->id
@@ -1481,6 +1656,9 @@ void Slave::killTask(
         LOG(WARNING) << "Killing the unregistered executor '" << executor->id
                      << "' of framework " << framework->id
                      << " because it has no tasks";
+
+        executor->state = Executor::TERMINATING;
+
         containerizer->destroy(executor->containerId);
       }
       break;
@@ -1493,12 +1671,31 @@ void Slave::killTask(
                    << "' is terminating/terminated";
       break;
     case Executor::RUNNING: {
-      // Send a message to the executor and wait for
-      // it to send us a status update.
-      KillTaskMessage message;
-      message.mutable_framework_id()->MergeFrom(frameworkId);
-      message.mutable_task_id()->MergeFrom(taskId);
-      send(executor->pid, message);
+      if (executor->queuedTasks.contains(taskId)) {
+        // This is the case where the task has not yet been sent to
+        // the executor (e.g., waiting for containerizer update to
+        // finish).
+        const StatusUpdate& update = protobuf::createStatusUpdate(
+            frameworkId,
+            info.id(),
+            taskId,
+            TASK_KILLED,
+            TaskStatus::SOURCE_SLAVE,
+            "Task killed when it was queued",
+            None(),
+            executor->id);
+
+        // NOTE: Sending a terminal update (TASK_KILLED) removes the
+        // task from 'executor->queuedTasks'.
+        statusUpdate(update, UPID());
+      } else {
+        // Send a message to the executor and wait for
+        // it to send us a status update.
+        KillTaskMessage message;
+        message.mutable_framework_id()->MergeFrom(frameworkId);
+        message.mutable_task_id()->MergeFrom(taskId);
+        send(executor->pid, message);
+      }
       break;
     }
     default:
@@ -1609,7 +1806,6 @@ void Slave::schedulerMessage(
   if (state != RUNNING) {
     LOG(WARNING) << "Dropping message from framework "<< frameworkId
                  << " because the slave is in " << state << " state";
-    stats.invalidFrameworkMessages++;
     metrics.invalid_framework_messages++;
     return;
   }
@@ -1619,7 +1815,6 @@ void Slave::schedulerMessage(
   if (framework == NULL) {
     LOG(WARNING) << "Dropping message from framework "<< frameworkId
                  << " because framework does not exist";
-    stats.invalidFrameworkMessages++;
     metrics.invalid_framework_messages++;
     return;
   }
@@ -1631,7 +1826,6 @@ void Slave::schedulerMessage(
   if (framework->state == Framework::TERMINATING) {
     LOG(WARNING) << "Dropping message from framework "<< frameworkId
                  << " because framework is terminating";
-    stats.invalidFrameworkMessages++;
     metrics.invalid_framework_messages++;
     return;
   }
@@ -1641,7 +1835,6 @@ void Slave::schedulerMessage(
     LOG(WARNING) << "Dropping message for executor '"
                  << executorId << "' of framework " << frameworkId
                  << " because executor does not exist";
-    stats.invalidFrameworkMessages++;
     metrics.invalid_framework_messages++;
     return;
   }
@@ -1657,7 +1850,6 @@ void Slave::schedulerMessage(
       LOG(WARNING) << "Dropping message for executor '"
                    << executorId << "' of framework " << frameworkId
                    << " because executor is not running";
-      stats.invalidFrameworkMessages++;
       metrics.invalid_framework_messages++;
       break;
     case Executor::RUNNING: {
@@ -1667,7 +1859,6 @@ void Slave::schedulerMessage(
       message.mutable_executor_id()->MergeFrom(executorId);
       message.set_data(data);
       send(executor->pid, message);
-      stats.validFrameworkMessages++;
       metrics.valid_framework_messages++;
       break;
     }
@@ -1689,7 +1880,6 @@ void Slave::updateFramework(const FrameworkID& frameworkId, const string& pid)
   if (state != RUNNING) {
     LOG(WARNING) << "Dropping updateFramework message for "<< frameworkId
                  << " because the slave is in " << state << " state";
-    stats.invalidFrameworkMessages++;
     metrics.invalid_framework_messages++;
     return;
   }
@@ -1731,6 +1921,73 @@ void Slave::updateFramework(const FrameworkID& frameworkId, const string& pid)
                 << " is in unexpected state " << framework->state;
       break;
   }
+}
+
+
+void Slave::checkpointResources(const vector<Resource>& _checkpointedResources)
+{
+  // TODO(jieyu): Here we assume that CheckpointResourcesMessages are
+  // ordered (i.e., slave receives them in the same order master sends
+  // them). This should be true in most of the cases because TCP
+  // enforces in order delivery per connection. However, the ordering
+  // is technically not guaranteed because master creates multiple
+  // connections to the slave in some cases (e.g., persistent socket
+  // to slave breaks and master uses ephemeral socket). This could
+  // potentially be solved by using a version number and rejecting
+  // stale messages according to the version number.
+  //
+  // If CheckpointResourcesMessages are delivered out-of-order, there
+  // are two cases to consider:
+  //  (1) If master does not fail over, it will reconcile the state
+  //      with the slave if the framework later changes the
+  //      checkpointed resources. Since master is the source of truth
+  //      for reservations, the inconsistency is not exposed to
+  //      frameworks.
+  //  (2) If master does fail over, the slave will inform the new
+  //      master about the incorrect checkpointed resources. When that
+  //      happens, we expect framework to reconcile based on the
+  //      offers they get.
+  Resources newCheckpointedResources = _checkpointedResources;
+
+  CHECK_SOME(state::checkpoint(
+      paths::getResourcesInfoPath(metaDir),
+      newCheckpointedResources))
+    << "Failed to checkpoint resources " << newCheckpointedResources;
+
+  // Creates persistent volumes that do not exist and schedules
+  // releasing those persistent volumes that are no longer needed.
+  //
+  // TODO(jieyu): Consider introducing a volume manager once we start
+  // to support multiple disks, or raw disks. Depending on the
+  // DiskInfo, we may want to create either directories under a root
+  // directory, or LVM volumes from a given device.
+  Resources volumes = newCheckpointedResources.persistentVolumes();
+
+  foreach (const Resource& volume, volumes) {
+    // This is validated in master.
+    CHECK_NE(volume.role(), "*");
+
+    string path = paths::getPersistentVolumePath(
+        flags.work_dir,
+        volume.role(),
+        volume.disk().persistence().id());
+
+    if (!os::exists(path)) {
+      CHECK_SOME(os::mkdir(path, true))
+        << "Failed to create persistent volume at '" << path << "'";
+    }
+  }
+
+  // TODO(jieyu): Schedule gc for released persistent volumes. We need
+  // to consider dynamic reservation here because the framework can
+  // release dynamic reservation while still wants to keep the
+  // persistent volume.
+
+  LOG(INFO) << "Updated checkpointed resources from "
+            << checkpointedResources << " to "
+            << newCheckpointedResources;
+
+  checkpointedResources = newCheckpointedResources;
 }
 
 
@@ -1948,22 +2205,6 @@ void Slave::registerExecutor(
         CHECK_SOME(state::checkpoint(path, executor->pid));
       }
 
-      // First account for the tasks we're about to start.
-      // TODO(vinod): Use foreachvalue instead once LinkedHashmap
-      // supports it.
-      foreach (const TaskInfo& task, executor->queuedTasks.values()) {
-        // Add the task to the executor.
-        executor->addTask(task);
-      }
-
-      // Now that the executor is up, set its resource limits
-      // including the currently queued tasks.
-      // TODO(Charles Reiss): We don't actually have a guarantee
-      // that this will be delivered or (where necessary) acted on
-      // before the executor gets its RunTaskMessages.
-      // TODO(idownes): Wait until this completes.
-      containerizer->update(executor->containerId, executor->resources);
-
       // Tell executor it's registered and give it any queued tasks.
       ExecutorRegisteredMessage message;
       message.mutable_executor_info()->MergeFrom(executor->info);
@@ -1973,24 +2214,27 @@ void Slave::registerExecutor(
       message.mutable_slave_info()->MergeFrom(info);
       send(executor->pid, message);
 
-      // TODO(vinod): Use foreachvalue instead once LinkedHashmap
+      // Update the resource limits for the container. Note that the
+      // resource limits include the currently queued tasks because we
+      // want the container to have enough resources to hold the
+      // upcoming tasks.
+      Resources resources = executor->resources;
+
+      // TODO(jieyu): Use foreachvalue instead once LinkedHashmap
       // supports it.
       foreach (const TaskInfo& task, executor->queuedTasks.values()) {
-        LOG(INFO) << "Flushing queued task " << task.task_id()
-                  << " for executor '" << executor->id << "'"
-                  << " of framework " << framework->id;
-
-        stats.tasks[TASK_STAGING]++;
-
-        RunTaskMessage message;
-        message.mutable_framework_id()->MergeFrom(framework->id);
-        message.mutable_framework()->MergeFrom(framework->info);
-        message.set_pid(framework->pid);
-        message.mutable_task()->MergeFrom(task);
-        send(executor->pid, message);
+        resources += task.resources();
       }
 
-      executor->queuedTasks.clear();
+      containerizer->update(executor->containerId, resources)
+        .onAny(defer(
+            self(),
+            &Self::runTasks,
+            lambda::_1,
+            frameworkId,
+            executorId,
+            executor->containerId,
+            executor->queuedTasks.values()));
       break;
     }
     default:
@@ -2094,10 +2338,18 @@ void Slave::reregisterExecutor(
       }
 
       // Tell the containerizer to update the resources.
-      // TODO(idownes): Wait until this completes.
-      containerizer->update(executor->containerId, executor->resources);
+      containerizer->update(executor->containerId, executor->resources)
+        .onAny(defer(
+            self(),
+            &Self::_reregisterExecutor,
+            lambda::_1,
+            frameworkId,
+            executorId,
+            executor->containerId));
 
       // Monitor the executor.
+      // TODO(jieyu): Do not start the monitor if the containerizer
+      // update fails.
       monitor.start(
           executor->containerId,
           executor->info,
@@ -2156,6 +2408,23 @@ void Slave::reregisterExecutor(
 }
 
 
+void Slave::_reregisterExecutor(
+    const Future<Nothing>& future,
+    const FrameworkID& frameworkId,
+    const ExecutorID& executorId,
+    const ContainerID& containerId)
+{
+  if (!future.isReady()) {
+    LOG(ERROR) << "Failed to update resources for container " << containerId
+               << " of executor '" << executorId
+               << "' of framework " << frameworkId
+               << ", destroying container: "
+               << (future.isFailed() ? future.failure() : "discarded");
+
+    containerizer->destroy(containerId);
+  }
+}
+
 
 void Slave::reregisterExecutorTimeout()
 {
@@ -2210,7 +2479,7 @@ void Slave::reregisterExecutorTimeout()
 // reliable delivery of status updates. Since executor driver caches
 // unacked updates it is important that whoever sent the update gets
 // acknowledgement for it.
-void Slave::statusUpdate(const StatusUpdate& update, const UPID& pid)
+void Slave::statusUpdate(StatusUpdate update, const UPID& pid)
 {
   LOG(INFO) << "Handling status update " << update << " from " << pid;
 
@@ -2218,15 +2487,14 @@ void Slave::statusUpdate(const StatusUpdate& update, const UPID& pid)
         state == RUNNING || state == TERMINATING)
     << state;
 
-  TaskStatus status = update.status();
-  status.set_source(pid == UPID() ? TaskStatus::SOURCE_SLAVE
-                                  : TaskStatus::SOURCE_EXECUTOR);
+  // Set the source before forwarding the status update.
+  update.mutable_status()->set_source(
+      pid == UPID() ? TaskStatus::SOURCE_SLAVE : TaskStatus::SOURCE_EXECUTOR);
 
   Framework* framework = getFramework(update.framework_id());
   if (framework == NULL) {
     LOG(WARNING) << "Ignoring status update " << update
                  << " for unknown framework " << update.framework_id();
-    stats.invalidStatusUpdates++;
     metrics.invalid_status_updates++;
     return;
   }
@@ -2240,16 +2508,16 @@ void Slave::statusUpdate(const StatusUpdate& update, const UPID& pid)
   if (framework->state == Framework::TERMINATING) {
     LOG(WARNING) << "Ignoring status update " << update
                  << " for terminating framework " << framework->id;
-    stats.invalidStatusUpdates++;
     metrics.invalid_status_updates++;
     return;
   }
+
+  TaskStatus status = update.status();
 
   Executor* executor = framework->getExecutor(status.task_id());
   if (executor == NULL) {
     LOG(WARNING)  << "Could not find the executor for "
                   << "status update " << update;
-    stats.validStatusUpdates++;
     metrics.valid_status_updates++;
 
     // NOTE: We forward the update here because this update could be
@@ -2284,9 +2552,6 @@ void Slave::statusUpdate(const StatusUpdate& update, const UPID& pid)
                  << " (" << executor->pid << ")";
   }
 
-  stats.tasks[status.state()]++;
-  stats.validStatusUpdates++;
-
   metrics.valid_status_updates++;
 
   // We set the latest state of the task here so that the slave can
@@ -2307,7 +2572,7 @@ void Slave::statusUpdate(const StatusUpdate& update, const UPID& pid)
   if (protobuf::isTerminalState(status.state()) &&
       (executor->queuedTasks.contains(status.task_id()) ||
        executor->launchedTasks.contains(status.task_id()))) {
-    executor->terminateTask(status.task_id(), status.state());
+    executor->terminateTask(status.task_id(), status);
 
     // Wait until the container's resources have been updated before
     // sending the status update.
@@ -2489,7 +2754,6 @@ void Slave::executorMessage(
     LOG(WARNING) << "Dropping framework message from executor "
                  << executorId << " to framework " << frameworkId
                  << " because the slave is in " << state << " state";
-    stats.invalidFrameworkMessages++;
     metrics.invalid_framework_messages++;
     return;
   }
@@ -2499,7 +2763,6 @@ void Slave::executorMessage(
     LOG(WARNING) << "Cannot send framework message from executor "
                  << executorId << " to framework " << frameworkId
                  << " because framework does not exist";
-    stats.invalidFrameworkMessages++;
     metrics.invalid_framework_messages++;
     return;
   }
@@ -2512,7 +2775,6 @@ void Slave::executorMessage(
     LOG(WARNING) << "Ignoring framework message from executor "
                  << executorId << " to framework " << frameworkId
                  << " because framework is terminating";
-    stats.invalidFrameworkMessages++;
     metrics.invalid_framework_messages++;
     return;
   }
@@ -2528,7 +2790,6 @@ void Slave::executorMessage(
   message.set_data(data);
   send(framework->pid, message);
 
-  stats.validFrameworkMessages++;
   metrics.valid_framework_messages++;
 }
 
@@ -2560,7 +2821,7 @@ void Slave::pingOld(const UPID& from, const string& body)
   // longer considers the slave to be registered, so it is
   // essential for the slave to attempt a re-registration
   // when this occurs.
-  Timer::cancel(pingTimer);
+  Clock::cancel(pingTimer);
 
   pingTimer = delay(
       MASTER_PING_TIMEOUT(),
@@ -2592,7 +2853,7 @@ void Slave::ping(const UPID& from, bool connected)
   // longer considers the slave to be registered, so it is
   // essential for the slave to attempt a re-registration
   // when this occurs.
-  Timer::cancel(pingTimer);
+  Clock::cancel(pingTimer);
 
   pingTimer = delay(
       MASTER_PING_TIMEOUT(),
@@ -3073,6 +3334,8 @@ void Slave::removeExecutor(Framework* framework, Executor* executor)
     }
   }
 
+  HookManager::slaveRemoveExecutorHook(framework->info, executor->info);
+
   framework->destroyExecutor(executor->id);
 }
 
@@ -3297,7 +3560,7 @@ void Slave::registerExecutorTimeout(
 // TODO(vinod): Figure out a way to express this function via cmd line.
 Duration Slave::age(double usage)
 {
-  return flags.gc_delay * std::max(0.0, (1.0 - GC_DISK_HEADROOM - usage));
+  return flags.gc_delay * std::max(0.0, (1.0 - flags.gc_disk_headroom - usage));
 }
 
 
@@ -3318,68 +3581,102 @@ void Slave::_checkDiskUsage(const Future<double>& usage)
     LOG(ERROR) << "Failed to get disk usage: "
                << (usage.isFailed() ? usage.failure() : "future discarded");
   } else {
-    LOG(INFO) << "Current usage " << std::setiosflags(std::ios::fixed)
+    executorDirectoryMaxAllowedAge = age(usage.get());
+    LOG(INFO) << "Current disk usage " << std::setiosflags(std::ios::fixed)
               << std::setprecision(2) << 100 * usage.get() << "%."
-              << " Max allowed age: " << age(usage.get());
+              << " Max allowed age: " << executorDirectoryMaxAllowedAge;
 
     // We prune all directories whose deletion time is within
     // the next 'gc_delay - age'. Since a directory is always
     // scheduled for deletion 'gc_delay' into the future, only directories
     // that are at least 'age' old are deleted.
-    gc->prune(flags.gc_delay - age(usage.get()));
+    gc->prune(flags.gc_delay - executorDirectoryMaxAllowedAge);
   }
   delay(flags.disk_watch_interval, self(), &Slave::checkDiskUsage);
 }
 
 
 
-Future<Nothing> Slave::recover(const Result<SlaveState>& _state)
+Future<Nothing> Slave::recover(const Result<state::State>& state)
 {
-  if (_state.isError()) {
-    return Failure(_state.error());
+  if (state.isError()) {
+    return Failure(state.error());
   }
 
-  // Convert Result<SlaveState> to Option<SlaveState> for convenience.
-  Option<SlaveState> state;
-  if (_state.isSome()) {
-    state = _state.get();
+  Option<ResourcesState> resourcesState;
+  Option<SlaveState> slaveState;
+  if (state.isSome()) {
+    resourcesState = state.get().resources;
+    slaveState = state.get().slave;
   }
 
-  if (state.isSome() && state.get().info.isSome()) {
+  // Recover checkpointed resources.
+  // NOTE: 'resourcesState' is None if the slave rootDir does not
+  // exist or the resources checkpoint file cannot be found.
+  if (resourcesState.isSome()) {
+    if (resourcesState.get().errors > 0) {
+      LOG(WARNING) << "Errors encountered during resources recovery: "
+                   << resourcesState.get().errors;
+
+      metrics.recovery_errors += resourcesState.get().errors;
+    }
+
+    // This is to verify that the checkpointed resources are
+    // compatible with the slave resources specified through the
+    // '--resources' command line flag.
+    Try<Resources> totalResources = applyCheckpointedResources(
+        info.resources(),
+        resourcesState.get().resources);
+
+    if (totalResources.isError()) {
+      return Failure(
+          "Checkpointed resources " +
+          stringify(resourcesState.get().resources) +
+          " are incompatible with slave resources " +
+          stringify(info.resources()) + ": " +
+          totalResources.error());
+    }
+
+    checkpointedResources = resourcesState.get().resources;
+  }
+
+  if (slaveState.isSome() && slaveState.get().info.isSome()) {
     // Check for SlaveInfo compatibility.
     // TODO(vinod): Also check for version compatibility.
-    // NOTE: We set the 'id' field in 'info' from the recovered state,
+    // NOTE: We set the 'id' field in 'info' from the recovered slave,
     // as a hack to compare the info created from options/flags with
     // the recovered info.
-    info.mutable_id()->CopyFrom(state.get().id);
-    if (flags.recover == "reconnect" && !(info == state.get().info.get())) {
+    info.mutable_id()->CopyFrom(slaveState.get().id);
+    if (flags.recover == "reconnect" &&
+        !(info == slaveState.get().info.get())) {
       return Failure(strings::join(
           "\n",
           "Incompatible slave info detected.",
           "------------------------------------------------------------",
-          "Old slave info:\n" + stringify(state.get().info.get()),
+          "Old slave info:\n" + stringify(slaveState.get().info.get()),
           "------------------------------------------------------------",
           "New slave info:\n" + stringify(info),
           "------------------------------------------------------------"));
     }
 
-    info = state.get().info.get(); // Recover the slave info.
+    info = slaveState.get().info.get(); // Recover the slave info.
 
-    recoveryErrors = state.get().errors;
-    metrics.recovery_errors += state.get().errors;
-    if (recoveryErrors > 0) {
-      LOG(WARNING) << "Errors encountered during recovery: " << recoveryErrors;
+    if (slaveState.get().errors > 0) {
+      LOG(WARNING) << "Errors encountered during slave recovery: "
+                   << slaveState.get().errors;
+
+      metrics.recovery_errors += slaveState.get().errors;
     }
 
     // Recover the frameworks.
     foreachvalue (const FrameworkState& frameworkState,
-                  state.get().frameworks) {
+                  slaveState.get().frameworks) {
       recoverFramework(frameworkState);
     }
   }
 
-  return statusUpdateManager->recover(metaDir, state)
-    .then(defer(self(), &Slave::_recoverContainerizer, state));
+  return statusUpdateManager->recover(metaDir, slaveState)
+    .then(defer(self(), &Slave::_recoverContainerizer, slaveState));
 }
 
 
@@ -3486,7 +3783,7 @@ void Slave::__recover(const Future<Nothing>& future)
     foreach (const string& entry, entries.get()) {
       string path = path::join(directory, entry);
       // Ignore non-directory entries.
-      if (!os::isdir(path)) {
+      if (!os::stat::isdir(path)) {
         continue;
       }
 
@@ -3579,7 +3876,7 @@ void Slave::recoverFramework(const FrameworkState& state)
 
 Future<Nothing> Slave::garbageCollect(const string& path)
 {
-  Try<long> mtime = os::mtime(path);
+  Try<long> mtime = os::stat::mtime(path);
   if (mtime.isError()) {
     LOG(ERROR) << "Failed to find the mtime of '" << path
                << "': " << mtime.error();
@@ -3697,6 +3994,12 @@ double Slave::_executors_terminating()
 }
 
 
+double Slave::_executor_directory_max_allowed_age_secs()
+{
+  return executorDirectoryMaxAllowedAge.secs();
+}
+
+
 void Slave::sendExecutorTerminatedStatusUpdate(
     const TaskID& taskId,
     const Future<containerizer::Termination>& termination,
@@ -3726,155 +4029,6 @@ void Slave::sendExecutorTerminatedStatusUpdate(
       reason,
       executor->id),
       UPID());
-}
-
-
-Slave::Metrics::Metrics(const Slave& slave)
-  : uptime_secs(
-        "slave/uptime_secs",
-        defer(slave, &Slave::_uptime_secs)),
-    registered(
-        "slave/registered",
-        defer(slave, &Slave::_registered)),
-    recovery_errors(
-        "slave/recovery_errors"),
-    frameworks_active(
-        "slave/frameworks_active",
-        defer(slave, &Slave::_frameworks_active)),
-    tasks_staging(
-        "slave/tasks_staging",
-        defer(slave, &Slave::_tasks_staging)),
-    tasks_starting(
-        "slave/tasks_starting",
-        defer(slave, &Slave::_tasks_starting)),
-    tasks_running(
-        "slave/tasks_running",
-        defer(slave, &Slave::_tasks_running)),
-    tasks_finished(
-        "slave/tasks_finished"),
-    tasks_failed(
-        "slave/tasks_failed"),
-    tasks_killed(
-        "slave/tasks_killed"),
-    tasks_lost(
-        "slave/tasks_lost"),
-    executors_registering(
-        "slave/executors_registering",
-        defer(slave, &Slave::_executors_registering)),
-    executors_running(
-        "slave/executors_running",
-        defer(slave, &Slave::_executors_running)),
-    executors_terminating(
-        "slave/executors_terminating",
-        defer(slave, &Slave::_executors_terminating)),
-    executors_terminated(
-        "slave/executors_terminated"),
-    valid_status_updates(
-        "slave/valid_status_updates"),
-    invalid_status_updates(
-        "slave/invalid_status_updates"),
-    valid_framework_messages(
-        "slave/valid_framework_messages"),
-    invalid_framework_messages(
-        "slave/invalid_framework_messages")
-{
-  // TODO(dhamon): Check return values for metric registration.
-  process::metrics::add(uptime_secs);
-  process::metrics::add(registered);
-
-  process::metrics::add(recovery_errors);
-
-  process::metrics::add(frameworks_active);
-
-  process::metrics::add(tasks_staging);
-  process::metrics::add(tasks_starting);
-  process::metrics::add(tasks_running);
-  process::metrics::add(tasks_finished);
-  process::metrics::add(tasks_failed);
-  process::metrics::add(tasks_killed);
-  process::metrics::add(tasks_lost);
-
-  process::metrics::add(executors_registering);
-  process::metrics::add(executors_running);
-  process::metrics::add(executors_terminating);
-  process::metrics::add(executors_terminated);
-
-  process::metrics::add(valid_status_updates);
-  process::metrics::add(invalid_status_updates);
-
-  process::metrics::add(valid_framework_messages);
-  process::metrics::add(invalid_framework_messages);
-
-  // Create resource gauges.
-  // TODO(dhamon): Set these up dynamically when creating a slave
-  // based on the resources it exposes.
-  const string resources[] = {"cpus", "mem", "disk"};
-
-  foreach (const string& resource, resources) {
-    process::metrics::Gauge totalGauge(
-        "slave/" + resource + "_total",
-        defer(slave, &Slave::_resources_total, resource));
-    resources_total.push_back(totalGauge);
-    process::metrics::add(totalGauge);
-
-    process::metrics::Gauge usedGauge(
-        "slave/" + resource + "_used",
-        defer(slave, &Slave::_resources_used, resource));
-    resources_used.push_back(usedGauge);
-    process::metrics::add(usedGauge);
-
-    process::metrics::Gauge percentGauge(
-        "slave/" + resource + "_percent",
-        defer(slave, &Slave::_resources_percent, resource));
-    resources_percent.push_back(percentGauge);
-    process::metrics::add(percentGauge);
-  }
-}
-
-
-Slave::Metrics::~Metrics()
-{
-  // TODO(dhamon): Check return values of unregistered metrics.
-  process::metrics::remove(uptime_secs);
-  process::metrics::remove(registered);
-
-  process::metrics::remove(recovery_errors);
-
-  process::metrics::remove(frameworks_active);
-
-  process::metrics::remove(tasks_staging);
-  process::metrics::remove(tasks_starting);
-  process::metrics::remove(tasks_running);
-  process::metrics::remove(tasks_finished);
-  process::metrics::remove(tasks_failed);
-  process::metrics::remove(tasks_killed);
-  process::metrics::remove(tasks_lost);
-
-  process::metrics::remove(executors_registering);
-  process::metrics::remove(executors_running);
-  process::metrics::remove(executors_terminating);
-  process::metrics::remove(executors_terminated);
-
-  process::metrics::remove(valid_status_updates);
-  process::metrics::remove(invalid_status_updates);
-
-  process::metrics::remove(valid_framework_messages);
-  process::metrics::remove(invalid_framework_messages);
-
-  foreach (const process::metrics::Gauge& gauge, resources_total) {
-    process::metrics::remove(gauge);
-  }
-  resources_total.clear();
-
-  foreach (const process::metrics::Gauge& gauge, resources_used) {
-    process::metrics::remove(gauge);
-  }
-  resources_used.clear();
-
-  foreach (const process::metrics::Gauge& gauge, resources_percent) {
-    process::metrics::remove(gauge);
-  }
-  resources_percent.clear();
 }
 
 
@@ -4300,7 +4454,7 @@ Task* Executor::addTask(const TaskInfo& task)
 
 void Executor::terminateTask(
     const TaskID& taskId,
-    const mesos::TaskState& state)
+    const mesos::TaskStatus& status)
 {
   VLOG(1) << "Terminating task " << taskId;
 
@@ -4308,7 +4462,7 @@ void Executor::terminateTask(
   // Remove the task if it's queued.
   if (queuedTasks.contains(taskId)) {
     task = new Task(
-        protobuf::createTask(queuedTasks[taskId], state, frameworkId));
+        protobuf::createTask(queuedTasks[taskId], status.state(), frameworkId));
     queuedTasks.erase(taskId);
   } else if (launchedTasks.contains(taskId)) {
     // Update the resources if it's been launched.
@@ -4317,7 +4471,7 @@ void Executor::terminateTask(
     launchedTasks.erase(taskId);
   }
 
-  switch (state) {
+  switch (status.state()) {
     case TASK_FINISHED:
       ++slave->metrics.tasks_finished;
       break;
@@ -4331,10 +4485,12 @@ void Executor::terminateTask(
       ++slave->metrics.tasks_lost;
       break;
     default:
-      LOG(WARNING) << "Unhandled task state " << state << " on completion.";
+      LOG(WARNING) << "Unhandled task state " << status.state()
+                   << " on completion.";
       break;
   }
 
+  // TODO(dhamon): Update source/reason metrics.
   terminatedTasks[taskId] = CHECK_NOTNULL(task);
 }
 
@@ -4417,7 +4573,7 @@ void Executor::recoverTask(const TaskState& state)
     // terminal updates (e.g., when slave recovery is always enabled).
     if (protobuf::isTerminalState(update.status().state()) &&
         launchedTasks.contains(state.id)) {
-      terminateTask(state.id, update.status().state());
+      terminateTask(state.id, update.status());
 
       // If the terminal update has been acknowledged, remove it.
       if (state.acks.contains(UUID::fromBytes(update.uuid()))) {

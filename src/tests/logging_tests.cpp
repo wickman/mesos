@@ -26,19 +26,20 @@
 
 #include "logging/logging.hpp"
 
-using namespace mesos::internal;
-
 using process::http::BadRequest;
 using process::http::OK;
 using process::http::Response;
+
+namespace mesos {
+namespace internal {
+namespace tests {
 
 
 TEST(LoggingTest, Toggle)
 {
   process::PID<> pid;
   pid.id = "logging";
-  pid.ip = process::ip();
-  pid.port = process::port();
+  pid.address = process::address();
 
   process::Future<Response> response = process::http::get(pid, "toggle");
 
@@ -79,3 +80,7 @@ TEST(LoggingTest, Toggle)
       "Invalid level '-1'.\n",
       response);
 }
+
+} // namespace tests {
+} // namespace internal {
+} // namespace mesos {

@@ -21,6 +21,7 @@
 
 #include <string>
 
+#include <stout/ip.hpp>
 #include <stout/option.hpp>
 
 #include "messages/messages.hpp"
@@ -36,6 +37,7 @@ namespace protobuf {
 
 bool isTerminalState(const TaskState& state);
 
+
 StatusUpdate createStatusUpdate(
     const FrameworkID& frameworkId,
     const Option<SlaveID>& slaveId,
@@ -44,12 +46,18 @@ StatusUpdate createStatusUpdate(
     const TaskStatus::Source& source,
     const std::string& message = "",
     const Option<TaskStatus::Reason>& reason = None(),
-    const Option<ExecutorID>& executorId = None());
+    const Option<ExecutorID>& executorId = None(),
+    const Option<bool>& healthy = None());
+
 
 Task createTask(
     const TaskInfo& task,
     const TaskState& state,
     const FrameworkID& frameworkId);
+
+
+Option<bool> getTaskHealth(const Task& task);
+
 
 // Helper function that creates a MasterInfo from UPID.
 MasterInfo createMasterInfo(const process::UPID& pid);

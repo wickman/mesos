@@ -27,7 +27,9 @@
 
 #include <boost/functional/hash.hpp>
 
+#include <stout/ip.hpp>
 #include <stout/net.hpp>
+#include <stout/mac.hpp>
 #include <stout/option.hpp>
 #include <stout/result.hpp>
 #include <stout/try.hpp>
@@ -131,7 +133,11 @@ public:
 
 private:
   Option<net::MAC> destinationMAC_;
+
+  // TODO(evelinad): Replace net::IP with net::IPNetwork when we will
+  // support classifiers for the entire subnet.
   Option<net::IP> destinationIP_;
+
   Option<PortRange> sourcePorts_;
   Option<PortRange> destinationPorts_;
 };
@@ -191,10 +197,17 @@ Try<bool> remove(
     const Classifier& classifier);
 
 
+// Returns all the IP packet filters attached to the given parent on
+// the link. Returns none if the link or the parent is not found.
+Result<std::vector<Filter<Classifier>>> filters(
+    const std::string& link,
+    const queueing::Handle& parent);
+
+
 // Returns the classifiers of all the IP packet filters attached to
 // the given parent on the link. Returns none if the link or the
 // parent is not found.
-Result<std::vector<Classifier> > classifiers(
+Result<std::vector<Classifier>> classifiers(
     const std::string& link,
     const queueing::Handle& parent);
 

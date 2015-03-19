@@ -144,6 +144,7 @@ check_PROGRAMS = stout-tests
 
 stout_tests_SOURCES =				\
   $(STOUT)/tests/base64_tests.cpp		\
+  $(STOUT)/tests/bits_tests.cpp			\
   $(STOUT)/tests/bytes_tests.cpp		\
   $(STOUT)/tests/cache_tests.cpp		\
   $(STOUT)/tests/svn_tests.cpp			\
@@ -155,14 +156,16 @@ stout_tests_SOURCES =				\
   $(STOUT)/tests/hashmap_tests.cpp		\
   $(STOUT)/tests/hashset_tests.cpp		\
   $(STOUT)/tests/interval_tests.cpp		\
+  $(STOUT)/tests/ip_tests.cpp                   \
   $(STOUT)/tests/json_tests.cpp			\
   $(STOUT)/tests/linkedhashmap_tests.cpp	\
+  $(STOUT)/tests/mac_tests.cpp                  \
   $(STOUT)/tests/main.cpp			\
   $(STOUT)/tests/multimap_tests.cpp		\
-  $(STOUT)/tests/net_tests.cpp			\
   $(STOUT)/tests/none_tests.cpp			\
   $(STOUT)/tests/option_tests.cpp		\
   $(STOUT)/tests/os_tests.cpp			\
+  $(STOUT)/tests/path_tests.cpp			\
   $(STOUT)/tests/protobuf_tests.cpp		\
   $(STOUT)/tests/protobuf_tests.pb.cc		\
   $(STOUT)/tests/protobuf_tests.pb.h		\

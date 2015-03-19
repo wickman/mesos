@@ -21,6 +21,7 @@
 #include <mesos/resources.hpp>
 
 #include <stout/foreach.hpp>
+#include <stout/protobuf.hpp>
 #include <stout/stringify.hpp>
 
 #include "common/attributes.hpp"
@@ -43,24 +44,22 @@ JSON::Object model(const Resources& resources)
   object.values["mem"] = 0;
   object.values["disk"] = 0;
 
-  const Option<double>& cpus = resources.cpus();
-  if (cpus.isSome()) {
-    object.values["cpus"] = cpus.get();
-  }
-
-  const Option<Bytes>& mem = resources.mem();
-  if (mem.isSome()) {
-    object.values["mem"] = mem.get().megabytes();
-  }
-
-  const Option<Bytes>& disk = resources.disk();
-  if (disk.isSome()) {
-    object.values["disk"] = disk.get().megabytes();
-  }
-
-  const Option<Value::Ranges>& ports = resources.ports();
-  if (ports.isSome()) {
-    object.values["ports"] = stringify(ports.get());
+  foreach (const Resource& resource, resources)
+  {
+    switch(resource.type())
+    {
+      case Value::SCALAR:
+        object.values[resource.name()] = resource.scalar().value();
+        break;
+      case Value::RANGES:
+        object.values[resource.name()] = stringify(resource.ranges());
+        break;
+      case Value::SET:
+        object.values[resource.name()] = stringify(resource.set());
+        break;
+      default:
+        LOG(FATAL) << "Unexpected Value type: " << resource.type();
+    }
   }
 
   return object;
@@ -124,11 +123,31 @@ JSON::Object model(const Task& task)
   object.values["state"] = TaskState_Name(task.state());
   object.values["resources"] = model(task.resources());
 
-  JSON::Array array;
-  foreach (const TaskStatus& status, task.statuses()) {
-    array.values.push_back(model(status));
+  {
+    JSON::Array array;
+    array.values.reserve(task.statuses().size()); // MESOS-2353.
+
+    foreach (const TaskStatus& status, task.statuses()) {
+      array.values.push_back(model(status));
+    }
+    object.values["statuses"] = array;
   }
-  object.values["statuses"] = array;
+
+  {
+    JSON::Array array;
+    if (task.has_labels()) {
+      array.values.reserve(task.labels().labels().size()); // MESOS-2353.
+
+      foreach (const Label& label, task.labels().labels()) {
+        array.values.push_back(JSON::Protobuf(label));
+      }
+    }
+    object.values["labels"] = array;
+  }
+
+  if (task.has_discovery()) {
+    object.values["discovery"] = JSON::Protobuf(task.discovery());
+  }
 
   return object;
 }
@@ -156,11 +175,31 @@ JSON::Object model(
   object.values["state"] = TaskState_Name(state);
   object.values["resources"] = model(task.resources());
 
-  JSON::Array array;
-  foreach (const TaskStatus& status, statuses) {
-    array.values.push_back(model(status));
+  {
+    JSON::Array array;
+    array.values.reserve(statuses.size()); // MESOS-2353.
+
+    foreach (const TaskStatus& status, statuses) {
+      array.values.push_back(model(status));
+    }
+    object.values["statuses"] = array;
   }
-  object.values["statuses"] = array;
+
+  {
+    JSON::Array array;
+    if (task.has_labels()) {
+      array.values.reserve(task.labels().labels().size()); // MESOS-2353.
+
+      foreach (const Label& label, task.labels().labels()) {
+        array.values.push_back(JSON::Protobuf(label));
+      }
+    }
+    object.values["labels"] = array;
+  }
+
+  if (task.has_discovery()) {
+    object.values["discovery"] = JSON::Protobuf(task.discovery());
+  }
 
   return object;
 }

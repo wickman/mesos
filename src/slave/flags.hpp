@@ -21,6 +21,11 @@
 
 #include <string>
 
+#include <mesos/mesos.hpp>
+#include <mesos/type_utils.hpp>
+
+#include <mesos/module/module.hpp>
+
 #include <stout/bytes.hpp>
 #include <stout/duration.hpp>
 #include <stout/flags.hpp>
@@ -42,6 +47,7 @@ class Flags : public logging::Flags
 {
 public:
   Flags()
+    : checkpoint(true)
   {
     add(&Flags::hostname,
         "hostname",
@@ -144,10 +150,21 @@ public:
         "the available disk usage.",
         GC_DELAY);
 
+    add(&Flags::gc_disk_headroom,
+        "gc_disk_headroom",
+        "Adjust disk headroom used to calculate maximum executor\n"
+        "directory age. Age is calculated by:\n"
+        "gc_delay * max(0.0, (1.0 - gc_disk_headroom - disk usage))\n"
+        "every --disk_watch_interval duration. gc_disk_headroom must\n"
+        "be a value between 0.0 and 1.0",
+        GC_DISK_HEADROOM);
+
     add(&Flags::disk_watch_interval,
         "disk_watch_interval",
         "Periodic time interval (e.g., 10secs, 2mins, etc)\n"
-        "to check the disk usage",
+        "to check the overall disk usage managed by the slave.\n"
+        "This drives the garbage collection of archived\n"
+        "information and sandboxes.",
         DISK_WATCH_INTERVAL);
 
     add(&Flags::resource_monitoring_interval,
@@ -155,16 +172,6 @@ public:
         "Periodic time interval for monitoring executor\n"
         "resource usage (e.g., 10secs, 1min, etc)",
         RESOURCE_MONITORING_INTERVAL);
-
-    // TODO(vinod): Consider killing this flag and always checkpoint.
-    add(&Flags::checkpoint,
-        "checkpoint",
-        "This flag is deprecated and will be removed in a future release.\n"
-        "Whether to checkpoint slave and frameworks information\n"
-        "to disk. This enables a restarted slave to recover\n"
-        "status updates and reconnect with (--recover=reconnect) or\n"
-        "kill (--recover=cleanup) old executors",
-        true);
 
     add(&Flags::recover,
         "recover",
@@ -206,11 +213,6 @@ public:
         "Name of the root cgroup\n",
         "mesos");
 
-    add(&Flags::cgroups_subsystems,
-        "cgroups_subsystems",
-        "This flag has been deprecated and is no longer used,\n"
-        "please update your flags");
-
     add(&Flags::cgroups_enable_cfs,
         "cgroups_enable_cfs",
         "Cgroups feature flag to enable hard limits on CPU resources\n"
@@ -222,6 +224,12 @@ public:
         "cgroups_limit_swap",
         "Cgroups feature flag to enable memory limits on both memory and\n"
         "swap instead of just memory.\n",
+        false);
+
+    add(&Flags::cgroups_cpu_enable_pids_and_tids_count,
+        "cgroups_cpu_enable_pids_and_tids_count",
+        "Cgroups feature flag to enable counting of processes and threads\n"
+        "inside a container.\n",
         false);
 
     add(&Flags::slave_subsystems,
@@ -342,33 +350,59 @@ public:
     add(&Flags::ephemeral_ports_per_container,
         "ephemeral_ports_per_container",
         "Number of ephemeral ports allocated to a container by the network\n"
-        "isolator. This number has to be a power of 2.\n",
+        "isolator. This number has to be a power of 2. This flag is used\n"
+        "for the 'network/port_mapping' isolator.",
         DEFAULT_EPHEMERAL_PORTS_PER_CONTAINER);
 
     add(&Flags::eth0_name,
         "eth0_name",
         "The name of the public network interface (e.g., eth0). If it is\n"
         "not specified, the network isolator will try to guess it based\n"
-        "on the host default gateway.");
+        "on the host default gateway. This flag is used for the\n"
+        "'network/port_mapping' isolator.");
 
     add(&Flags::lo_name,
         "lo_name",
         "The name of the loopback network interface (e.g., lo). If it is\n"
-        "not specified, the network isolator will try to guess it.");
+        "not specified, the network isolator will try to guess it. This\n"
+        "flag is used for the 'network/port_mapping' isolator.");
 
     add(&Flags::egress_rate_limit_per_container,
         "egress_rate_limit_per_container",
         "The limit of the egress traffic for each container, in Bytes/s.\n"
         "If not specified or specified as zero, the network isolator will\n"
         "impose no limits to containers' egress traffic throughput.\n"
-        "This flag uses the Bytes type, defined in stout.");
+        "This flag uses the Bytes type (defined in stout) and is used for\n"
+        "the 'network/port_mapping' isolator.");
 
-    add(&Flags::network_enable_socket_statistics,
-        "network_enable_socket_statistics",
-        "Whether to collect socket statistics (e.g., TCP RTT) for\n"
-        "each container.",
+    add(&Flags::network_enable_socket_statistics_summary,
+        "network_enable_socket_statistics_summary",
+        "Whether to collect socket statistics summary for each container.\n"
+        "This flag is used for the 'network/port_mapping' isolator.",
         false);
+
+    add(&Flags::network_enable_socket_statistics_details,
+        "network_enable_socket_statistics_details",
+        "Whether to collect socket statistics details (e.g., TCP RTT) for\n"
+        "each container. This flag is used for the 'network/port_mapping'\n"
+        "isolator.",
+        false);
+
 #endif // WITH_NETWORK_ISOLATOR
+
+    add(&Flags::container_disk_watch_interval,
+        "container_disk_watch_interval",
+        "The interval between disk quota checks for containers. This flag is\n"
+        "used for the 'posix/disk' isolator.",
+        Seconds(15));
+
+    // TODO(jieyu): Consider enabling this flag by default. Remember
+    // to update the user doc if we decide to do so.
+    add(&Flags::enforce_container_disk_quota,
+        "enforce_container_disk_quota",
+        "Whether to enable disk quota enforcement for containers. This flag\n"
+        "is used for the 'posix/disk' isolator.",
+        false);
 
     // This help message for --modules flag is the same for
     // {master,slave,tests}/flags.hpp and should always be kept in
@@ -416,6 +450,18 @@ public:
         "    }\n"
         "  ]\n"
         "}");
+
+    add(&Flags::authenticatee,
+        "authenticatee",
+        "Authenticatee implementation to use when authenticating against the\n"
+        "master. Use the default '" + DEFAULT_AUTHENTICATEE + "', or\n"
+        "load an alternate authenticatee module using --modules.",
+        DEFAULT_AUTHENTICATEE);
+
+    add(&Flags::hooks,
+        "hooks",
+        "A comma separated list of hook modules to be\n"
+        "installed inside the slave.");
   }
 
   bool version;
@@ -433,8 +479,11 @@ public:
   Duration executor_registration_timeout;
   Duration executor_shutdown_grace_period;
   Duration gc_delay;
+  double gc_disk_headroom;
   Duration disk_watch_interval;
   Duration resource_monitoring_interval;
+  // TODO(cmaloney): Remove checkpoint variable entirely, fixing tests
+  // which depend upon it. See MESOS-444 for more details.
   bool checkpoint;
   std::string recover;
   Duration recovery_timeout;
@@ -443,15 +492,15 @@ public:
 #ifdef __linux__
   std::string cgroups_hierarchy;
   std::string cgroups_root;
-  Option<std::string> cgroups_subsystems;
   bool cgroups_enable_cfs;
   bool cgroups_limit_swap;
+  bool cgroups_cpu_enable_pids_and_tids_count;
   Option<std::string> slave_subsystems;
   Option<std::string> perf_events;
   Duration perf_interval;
   Duration perf_duration;
 #endif
-  Option<std::string> credential;
+  Option<Path> credential;
   Option<std::string> containerizer_path;
   std::string containerizers;
   Option<std::string> default_container_image;
@@ -465,9 +514,14 @@ public:
   Option<std::string> eth0_name;
   Option<std::string> lo_name;
   Option<Bytes> egress_rate_limit_per_container;
-  bool network_enable_socket_statistics;
+  bool network_enable_socket_statistics_summary;
+  bool network_enable_socket_statistics_details;
 #endif
+  Duration container_disk_watch_interval;
+  bool enforce_container_disk_quota;
   Option<Modules> modules;
+  std::string authenticatee;
+  Option<std::string> hooks;
 };
 
 } // namespace slave {

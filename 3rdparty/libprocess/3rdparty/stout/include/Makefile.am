@@ -2,6 +2,7 @@
 nobase_include_HEADERS =		\
   stout/abort.hpp			\
   stout/base64.hpp			\
+  stout/bits.hpp			\
   stout/bytes.hpp			\
   stout/cache.hpp			\
   stout/check.hpp			\
@@ -11,6 +12,7 @@ nobase_include_HEADERS =		\
   stout/exit.hpp			\
   stout/fatal.hpp			\
   stout/flags.hpp			\
+  stout/flags/fetch.hpp			\
   stout/flags/flag.hpp			\
   stout/flags/flags.hpp			\
   stout/flags/loader.hpp		\
@@ -24,10 +26,12 @@ nobase_include_HEADERS =		\
   stout/hashmap.hpp			\
   stout/hashset.hpp			\
   stout/interval.hpp			\
+  stout/ip.hpp				\
   stout/json.hpp			\
   stout/lambda.hpp			\
   stout/linkedhashmap.hpp		\
   stout/list.hpp			\
+  stout/mac.hpp				\
   stout/memory.hpp			\
   stout/multihashmap.hpp		\
   stout/multimap.hpp			\
@@ -49,9 +53,11 @@ nobase_include_HEADERS =		\
   stout/os/osx.hpp			\
   stout/os/process.hpp			\
   stout/os/read.hpp			\
+  stout/os/rename.hpp			\
   stout/os/sendfile.hpp			\
   stout/os/shell.hpp			\
   stout/os/signals.hpp			\
+  stout/os/stat.hpp			\
   stout/os/permissions.hpp		\
   stout/os/pstree.hpp			\
   stout/os/sysctl.hpp			\

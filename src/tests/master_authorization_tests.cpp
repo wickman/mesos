@@ -31,22 +31,20 @@
 #include <stout/gtest.hpp>
 #include <stout/try.hpp>
 
-#include "master/allocator.hpp"
 #include "master/master.hpp"
+
+#include "master/allocator/allocator.hpp"
 
 #include "messages/messages.hpp"
 
 #include "slave/slave.hpp"
 
 #include "tests/mesos.hpp"
-
-using namespace mesos;
-using namespace mesos::internal;
-using namespace mesos::internal::tests;
+#include "tests/utils.hpp"
 
 using mesos::internal::master::Master;
 
-using mesos::internal::master::allocator::AllocatorProcess;
+using mesos::internal::master::allocator::MesosAllocatorProcess;
 
 using mesos::internal::slave::Slave;
 
@@ -62,6 +60,10 @@ using testing::An;
 using testing::AtMost;
 using testing::DoAll;
 using testing::Return;
+
+namespace mesos {
+namespace internal {
+namespace tests {
 
 
 class MasterAuthorizationTest : public MesosTest {};
@@ -205,7 +207,7 @@ TEST_F(MasterAuthorizationTest, UnauthorizedTask)
   driver.launchTasks(offers.get()[0].id(), tasks);
 
   AWAIT_READY(status);
-  EXPECT_EQ(TASK_LOST, status.get().state());
+  EXPECT_EQ(TASK_ERROR, status.get().state());
   EXPECT_EQ(TaskStatus::REASON_TASK_UNAUTHORIZED, status.get().reason());
 
   driver.stop();
@@ -272,15 +274,15 @@ TEST_F(MasterAuthorizationTest, KillTask)
   AWAIT_READY(status);
   EXPECT_EQ(TASK_KILLED, status.get().state());
 
-  Future<Nothing> resourcesRecovered =
-    FUTURE_DISPATCH(_, &AllocatorProcess::resourcesRecovered);
+  Future<Nothing> recoverResources =
+    FUTURE_DISPATCH(_, &MesosAllocatorProcess::recoverResources);
 
   // Now complete authorization.
   promise.set(true);
 
   // No task launch should happen resulting in all resources being
   // returned to the allocator.
-  AWAIT_READY(resourcesRecovered);
+  AWAIT_READY(recoverResources);
 
   driver.stop();
   driver.join();
@@ -348,8 +350,8 @@ TEST_F(MasterAuthorizationTest, SlaveRemoved)
   EXPECT_CALL(sched, statusUpdate(&driver, _))
     .WillOnce(FutureArg<1>(&status));
 
-  Future<Nothing> resourcesRecovered =
-    FUTURE_DISPATCH(_, &AllocatorProcess::resourcesRecovered);
+  Future<Nothing> recoverResources =
+    FUTURE_DISPATCH(_, &MesosAllocatorProcess::recoverResources);
 
   // Now complete authorization.
   promise.set(true);
@@ -360,7 +362,16 @@ TEST_F(MasterAuthorizationTest, SlaveRemoved)
 
   // No task launch should happen resulting in all resources being
   // returned to the allocator.
-  AWAIT_READY(resourcesRecovered);
+  AWAIT_READY(recoverResources);
+
+  // Check metrics.
+  JSON::Object stats = Metrics();
+  EXPECT_EQ(1u, stats.values.count("master/tasks_lost"));
+  EXPECT_EQ(1u, stats.values.count(
+                    "master/task_lost/source_master/reason_slave_removed"));
+  EXPECT_EQ(1u, stats.values["master/tasks_lost"]);
+  EXPECT_EQ(
+      1u, stats.values["master/task_lost/source_master/reason_slave_removed"]);
 
   driver.stop();
   driver.join();
@@ -422,20 +433,20 @@ TEST_F(MasterAuthorizationTest, SlaveDisconnected)
   EXPECT_CALL(sched, slaveLost(&driver, _))
     .Times(AtMost(1));
 
-  Future<Nothing> slaveDeactivated =
-    FUTURE_DISPATCH(_, &AllocatorProcess::slaveDeactivated);
+  Future<Nothing> deactivateSlave =
+    FUTURE_DISPATCH(_, &MesosAllocatorProcess::deactivateSlave);
 
   // Now stop the slave.
   Stop(slave.get());
 
-  AWAIT_READY(slaveDeactivated);
+  AWAIT_READY(deactivateSlave);
 
   Future<TaskStatus> status;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
     .WillOnce(FutureArg<1>(&status));
 
-  Future<Nothing> resourcesRecovered =
-    FUTURE_DISPATCH(_, &AllocatorProcess::resourcesRecovered);
+  Future<Nothing> recoverResources =
+    FUTURE_DISPATCH(_, &MesosAllocatorProcess::recoverResources);
 
   // Now complete authorization.
   promise.set(true);
@@ -446,7 +457,18 @@ TEST_F(MasterAuthorizationTest, SlaveDisconnected)
 
   // No task launch should happen resulting in all resources being
   // returned to the allocator.
-  AWAIT_READY(resourcesRecovered);
+  AWAIT_READY(recoverResources);
+
+  // Check metrics.
+  JSON::Object stats = Metrics();
+  EXPECT_EQ(1u, stats.values.count("master/tasks_lost"));
+  EXPECT_EQ(1u, stats.values["master/tasks_lost"]);
+  EXPECT_EQ(1u,
+            stats.values.count(
+                "master/task_lost/source_master/reason_slave_disconnected"));
+  EXPECT_EQ(
+      1u,
+      stats.values["master/task_lost/source_master/reason_slave_disconnected"]);
 
   driver.stop();
   driver.join();
@@ -501,24 +523,24 @@ TEST_F(MasterAuthorizationTest, FrameworkRemoved)
   // Wait until authorization is in progress.
   AWAIT_READY(authorize);
 
-  Future<Nothing> frameworkRemoved =
-    FUTURE_DISPATCH(_, &AllocatorProcess::frameworkRemoved);
+  Future<Nothing> removeFramework =
+    FUTURE_DISPATCH(_, &MesosAllocatorProcess::removeFramework);
 
   // Now stop the framework.
   driver.stop();
   driver.join();
 
-  AWAIT_READY(frameworkRemoved);
+  AWAIT_READY(removeFramework);
 
-  Future<Nothing> resourcesRecovered =
-    FUTURE_DISPATCH(_, &AllocatorProcess::resourcesRecovered);
+  Future<Nothing> recoverResources =
+    FUTURE_DISPATCH(_, &MesosAllocatorProcess::recoverResources);
 
   // Now complete authorization.
   promise.set(true);
 
   // No task launch should happen resulting in all resources being
   // returned to the allocator.
-  AWAIT_READY(resourcesRecovered);
+  AWAIT_READY(recoverResources);
 
   Shutdown(); // Must shutdown before 'containerizer' gets deallocated.
 }
@@ -838,6 +860,9 @@ TEST_F(MasterAuthorizationTest, DuplicateReregistration)
                     Return(promise3.future())))
     .WillRepeatedly(Return(true)); // Authorize subsequent registration retries.
 
+  // Pause the clock to avoid re-registration retries.
+  Clock::pause();
+
   driver.start();
 
   // Wait for the framework to be registered.
@@ -904,6 +929,9 @@ TEST_F(MasterAuthorizationTest, FrameworkRemovedBeforeRegistration)
                     Return(promise.future())))
     .WillRepeatedly(Return(true)); // Authorize subsequent registration retries.
 
+  // Pause the clock to avoid scheduler registration retries.
+  Clock::pause();
+
   driver.start();
 
   // Wait until authorization is in progress.
@@ -917,19 +945,18 @@ TEST_F(MasterAuthorizationTest, FrameworkRemovedBeforeRegistration)
 
   // Settle the clock here to ensure master handles the framework
   // 'exited' event.
-  Clock::pause();
   Clock::settle();
   Clock::resume();
 
-  Future<Nothing> frameworkRemoved =
-    FUTURE_DISPATCH(_, &AllocatorProcess::frameworkRemoved);
+  Future<Nothing> removeFramework =
+    FUTURE_DISPATCH(_, &MesosAllocatorProcess::removeFramework);
 
   // Now complete authorization.
   promise.set(true);
 
   // When the master tries to link to a non-existent framework PID
   // it should realize the framework is gone and remove it.
-  AWAIT_READY(frameworkRemoved);
+  AWAIT_READY(removeFramework);
 
   Shutdown();
 }
@@ -961,8 +988,10 @@ TEST_F(MasterAuthorizationTest, FrameworkRemovedBeforeReregistration)
   EXPECT_CALL(authorizer, authorize(An<const mesos::ACL::RegisterFramework&>()))
     .WillOnce(Return(true))
     .WillOnce(DoAll(FutureSatisfy(&authorize2),
-                    Return(promise2.future())))
-    .WillRepeatedly(Return(true)); // Authorize subsequent registration retries.
+                    Return(promise2.future())));
+
+  // Pause the clock to avoid scheduler registration retries.
+  Clock::pause();
 
   driver.start();
 
@@ -981,15 +1010,15 @@ TEST_F(MasterAuthorizationTest, FrameworkRemovedBeforeReregistration)
   // Wait until the second authorization attempt is in progress.
   AWAIT_READY(authorize2);
 
-  Future<Nothing> frameworkRemoved =
-    FUTURE_DISPATCH(_, &AllocatorProcess::frameworkRemoved);
+  Future<Nothing> removeFramework =
+    FUTURE_DISPATCH(_, &MesosAllocatorProcess::removeFramework);
 
   // Stop the framework.
   driver.stop();
   driver.join();
 
   // Wait until the framework is removed.
-  AWAIT_READY(frameworkRemoved);
+  AWAIT_READY(removeFramework);
 
   // Now complete the second authorization attempt.
   promise2.set(true);
@@ -998,8 +1027,11 @@ TEST_F(MasterAuthorizationTest, FrameworkRemovedBeforeReregistration)
   // because the framework PID was removed from 'authenticated' map.
   // Settle the clock here to ensure 'Master::_reregisterFramework()'
   // is executed.
-  Clock::pause();
   Clock::settle();
 
   Shutdown();
 }
+
+} // namespace tests {
+} // namespace internal {
+} // namespace mesos {

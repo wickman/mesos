@@ -36,7 +36,11 @@
 #serial 3
 
 m4_define([_AX_CXX_COMPILE_STDCXX_11_testbody], [
+  #include <initializer_list>
   #include <memory>
+  #include <mutex>
+  #include <string>
+  #include <vector>
 
   template <typename T, typename ...Args>
     struct check
@@ -74,6 +78,52 @@ m4_define([_AX_CXX_COMPILE_STDCXX_11_testbody], [
     }
 
     p1->bar();
+  }
+
+  std::shared_ptr<int> k = std::make_shared<int>(2);
+
+  void mutexTest()
+  {
+    std::mutex _mutex;
+    {
+      // scope of lockGuard.
+      std::lock_guard<std::mutex> lockGuard(_mutex);
+      // end scope of lockGuard.
+    }
+
+    {
+      // scope of uniqueLock.
+      std::unique_lock<std::mutex> uniqueLock(_mutex);
+      // end scope of uniqueLock.
+    }
+  }
+
+  // check for std::enable_shared_from_this.
+  struct SharedStruct : public std::enable_shared_from_this<SharedStruct>
+  {
+    std::shared_ptr<SharedStruct> get()
+    {
+      return shared_from_this();
+    }
+  };
+
+  // construct a new shared_ptr using shared_from_this().
+  std::shared_ptr<SharedStruct> object =
+    std::shared_ptr<SharedStruct>(new SharedStruct())->get();
+
+  // initializer lists.
+  std::vector<std::string> g = {"hello", "world"};
+
+  struct InitializerList
+  {
+    InitializerList(std::initializer_list<int>) {}
+    void doSomething(std::initializer_list<int>) {}
+  };
+
+  void initializerListClassTest()
+  {
+    InitializerList il{1,2,3,4};
+    il.doSomething({5,6,7,8});
   }
 ])
 

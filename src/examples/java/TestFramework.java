@@ -31,18 +31,22 @@ import org.apache.mesos.Protos.*;
 
 public class TestFramework {
   static class TestScheduler implements Scheduler {
-    public TestScheduler(ExecutorInfo executor) {
-      this(executor, 5);
+    public TestScheduler(boolean implicitAcknowledgements,
+                         ExecutorInfo executor) {
+      this(implicitAcknowledgements, executor, 5);
     }
 
-    public TestScheduler(ExecutorInfo executor, int totalTasks) {
+    public TestScheduler(boolean implicitAcknowledgements,
+                         ExecutorInfo executor,
+                         int totalTasks) {
+      this.implicitAcknowledgements = implicitAcknowledgements;
       this.executor = executor;
       this.totalTasks = totalTasks;
     }
 
     @Override
-    public void registered(SchedulerDriver driver, 
-                           FrameworkID frameworkId, 
+    public void registered(SchedulerDriver driver,
+                           FrameworkID frameworkId,
                            MasterInfo masterInfo) {
       System.out.println("Registered! ID = " + frameworkId.getValue());
     }
@@ -60,7 +64,7 @@ public class TestFramework {
       double MEM_PER_TASK = 128;
 
       for (Offer offer : offers) {
-        List<TaskInfo> tasks = new ArrayList<TaskInfo>();
+        Offer.Operation.Launch.Builder launch = Offer.Operation.Launch.newBuilder();
         double offerCpus = 0;
         double offerMem = 0;
         for (Resource resource : offer.getResourcesList()) {
@@ -101,13 +105,29 @@ public class TestFramework {
             .setExecutor(ExecutorInfo.newBuilder(executor))
             .build();
 
-          tasks.add(task);
+          launch.addTaskInfos(TaskInfo.newBuilder(task));
 
           remainingCpus -= CPUS_PER_TASK;
           remainingMem -= MEM_PER_TASK;
         }
+
+        // NOTE: We use the new API `acceptOffers` here to launch tasks. The
+        // 'launchTasks' API will be deprecated.
+        List<OfferID> offerIds = new ArrayList<OfferID>();
+        offerIds.add(offer.getId());
+
+        List<Offer.Operation> operations = new ArrayList<Offer.Operation>();
+
+        Offer.Operation operation = Offer.Operation.newBuilder()
+          .setType(Offer.Operation.Type.LAUNCH)
+          .setLaunch(launch)
+          .build();
+
+        operations.add(operation);
+
         Filters filters = Filters.newBuilder().setRefuseSeconds(1).build();
-        driver.launchTasks(offer.getId(), tasks, filters);
+
+        driver.acceptOffers(offerIds, operations, filters);
       }
     }
 
@@ -139,6 +159,10 @@ public class TestFramework {
                            " with message '" + status.getMessage() + "'");
         driver.abort();
       }
+
+      if (!implicitAcknowledgements) {
+        driver.acknowledgeStatusUpdate(status);
+      }
     }
 
     @Override
@@ -160,6 +184,7 @@ public class TestFramework {
       System.out.println("Error: " + message);
     }
 
+    private final boolean implicitAcknowledgements;
     private final ExecutorInfo executor;
     private final int totalTasks;
     private int launchedTasks = 0;
@@ -197,9 +222,16 @@ public class TestFramework {
       frameworkBuilder.setCheckpoint(true);
     }
 
+    boolean implicitAcknowledgements = true;
+
+    if (System.getenv("MESOS_EXPLICIT_ACKNOWLEDGEMENTS") != null) {
+      System.out.println("Enabling explicit acknowledgements for status updates");
+      implicitAcknowledgements = false;
+    }
+
     Scheduler scheduler = args.length == 1
-        ? new TestScheduler(executor)
-        : new TestScheduler(executor, Integer.parseInt(args[1]));
+        ? new TestScheduler(implicitAcknowledgements, executor)
+        : new TestScheduler(implicitAcknowledgements, executor, Integer.parseInt(args[1]));
 
     MesosSchedulerDriver driver = null;
     if (System.getenv("MESOS_AUTHENTICATE") != null) {
@@ -222,11 +254,16 @@ public class TestFramework {
 
       frameworkBuilder.setPrincipal(System.getenv("DEFAULT_PRINCIPAL"));
 
-      driver = new MesosSchedulerDriver(scheduler, frameworkBuilder.build(), args[0], credential);
+      driver = new MesosSchedulerDriver(
+          scheduler,
+          frameworkBuilder.build(),
+          args[0],
+          implicitAcknowledgements,
+          credential);
     } else {
       frameworkBuilder.setPrincipal("test-framework-java");
 
-      driver = new MesosSchedulerDriver(scheduler, frameworkBuilder.build(), args[0]);
+      driver = new MesosSchedulerDriver(scheduler, frameworkBuilder.build(), args[0], implicitAcknowledgements);
     }
 
     int status = driver.run() == Status.DRIVER_STOPPED ? 0 : 1;

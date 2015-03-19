@@ -12,7 +12,7 @@ The Mesos codebase follows the [Google C++ Style Guide](http://google-styleguide
 * We use [lowerCamelCase](http://en.wikipedia.org/wiki/CamelCase#Variations_and_synonyms) for variable names (Google uses snake_case, and their class member variables have trailing underscores).
 
 ### Constant Names
-* We use [lowerCamelCase](http://en.wikipedia.org/wiki/CamelCase#Variations_and_synonyms) for constant names (Google uses a `k` followed by mixed case, e.g. `kDaysInAWeek`).
+* We use [SCREAMING_SNAKE_CASE](http://en.wikipedia.org/wiki/Letter_case#Special_case_styles) for constant names (Google uses a `k` followed by mixed case, e.g. `kDaysInAWeek`).
 
 ### Function Names
 * We use [lowerCamelCase](http://en.wikipedia.org/wiki/CamelCase#Variations_and_synonyms) for function names (Google uses mixed case for regular functions; and their accessors and mutators match the name of the variable).
@@ -103,8 +103,15 @@ const typename map::iterator& i = values.find(keys.front());
 // 2: Don't use.
 auto authorizer = LocalAuthorizer::create(acls);
 // Compare with
-Try<Owned<LocalAuthorizer>> authorizer = LocalAuthorizer::create();
+Try&lt;Owned&lt;LocalAuthorizer>> authorizer = LocalAuthorizer::create();
 </pre>
 
 * Rvalue references.
 * Variadic templates.
+* Mutexes.
+    * std::mutex.
+    * std::lock_guard<std::mutex>.
+    * std::unique_lock<std::mutex>.
+* Shared from this.
+    * class T : public std::enable_shared_from_this<T>.
+    * shared_from_this().

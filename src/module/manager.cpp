@@ -21,6 +21,9 @@
 
 #include <mesos/module.hpp>
 
+#include <mesos/module/anonymous.hpp>
+#include <mesos/module/module.hpp>
+
 #include <stout/json.hpp>
 #include <stout/numify.hpp>
 #include <stout/os.hpp>
@@ -29,7 +32,9 @@
 #include <stout/version.hpp>
 
 #include "common/lock.hpp"
+
 #include "messages/messages.hpp"
+
 #include "module/manager.hpp"
 
 using std::list;
@@ -57,7 +62,10 @@ void ModuleManager::initialize()
   // current change.  Typically that should be the version currently
   // under development.
 
+  kindToVersion["Anonymous"] = MESOS_VERSION;
+  kindToVersion["Authenticatee"] = MESOS_VERSION;
   kindToVersion["Authenticator"] = MESOS_VERSION;
+  kindToVersion["Hook"] = MESOS_VERSION;
   kindToVersion["Isolator"] = MESOS_VERSION;
   kindToVersion["TestModule"] = MESOS_VERSION;
 
@@ -195,7 +203,8 @@ Try<Nothing> ModuleManager::load(const Modules& modules)
       Owned<DynamicLibrary> dynamicLibrary(new DynamicLibrary());
       Try<Nothing> result = dynamicLibrary->open(libraryName);
       if (!result.isSome()) {
-        return Error("Error opening library: '" + libraryName + "'");
+        return Error(
+            "Error opening library: '" + libraryName + "': " + result.error());
       }
 
       dynamicLibraries[libraryName] = dynamicLibrary;

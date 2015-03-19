@@ -38,8 +38,6 @@
 #include <linux/version.h>
 #endif // __linux__
 
-#include <sys/stat.h>
-#include <sys/statvfs.h>
 #ifdef __linux__
 #include <sys/sysinfo.h>
 #endif // __linux__
@@ -82,9 +80,11 @@
 #include <stout/os/permissions.hpp>
 #include <stout/os/pstree.hpp>
 #include <stout/os/read.hpp>
+#include <stout/os/rename.hpp>
 #include <stout/os/sendfile.hpp>
 #include <stout/os/shell.hpp>
 #include <stout/os/signals.hpp>
+#include <stout/os/stat.hpp>
 #ifdef __APPLE__
 #include <stout/os/sysctl.hpp>
 #endif // __APPLE__
@@ -225,8 +225,10 @@ inline Try<Nothing> utime(const std::string& path)
 inline Try<Nothing> touch(const std::string& path)
 {
   if (!exists(path)) {
-    Try<int> fd =
-      open(path, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IRWXO);
+    Try<int> fd = open(
+        path,
+        O_RDWR | O_CREAT,
+        S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 
     if (fd.isError()) {
       return Error("Failed to open file: " + fd.error());
@@ -293,8 +295,11 @@ inline Try<Nothing> write(int fd, const std::string& message)
 // open and closing the file.
 inline Try<Nothing> write(const std::string& path, const std::string& message)
 {
-  Try<int> fd = os::open(path, O_WRONLY | O_CREAT | O_TRUNC,
-                         S_IRUSR | S_IWUSR | S_IRGRP | S_IRWXO);
+  Try<int> fd = os::open(
+      path,
+      O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+      S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+
   if (fd.isError()) {
     return ErrnoError("Failed to open file '" + path + "'");
   }
@@ -360,52 +365,6 @@ inline Result<std::string> realpath(const std::string& path)
     return ErrnoError();
   }
   return std::string(temp);
-}
-
-
-inline bool isdir(const std::string& path)
-{
-  struct stat s;
-
-  if (::stat(path.c_str(), &s) < 0) {
-    return false;
-  }
-  return S_ISDIR(s.st_mode);
-}
-
-
-inline bool isfile(const std::string& path)
-{
-  struct stat s;
-
-  if (::stat(path.c_str(), &s) < 0) {
-    return false;
-  }
-  return S_ISREG(s.st_mode);
-}
-
-
-inline bool islink(const std::string& path)
-{
-  struct stat s;
-
-  if (::lstat(path.c_str(), &s) < 0) {
-    return false;
-  }
-  return S_ISLNK(s.st_mode);
-}
-
-
-// TODO(benh): Put this in the 'paths' or 'files' or 'fs' namespace.
-inline Try<long> mtime(const std::string& path)
-{
-  struct stat s;
-
-  if (::lstat(path.c_str(), &s) < 0) {
-    return ErrnoError("Error invoking stat for '" + path + "'");
-  }
-
-  return s.st_mtime;
 }
 
 
@@ -616,6 +575,29 @@ inline Try<Nothing> chdir(const std::string& directory)
 }
 
 
+inline Try<Nothing> chroot(const std::string& directory)
+{
+  if (::chroot(directory.c_str()) < 0) {
+    return ErrnoError();
+  }
+
+  return Nothing();
+}
+
+
+inline Try<Nothing> mknod(
+    const std::string& path,
+    mode_t mode,
+    dev_t dev)
+{
+  if (::mknod(path.c_str(), mode, dev) < 0) {
+    return ErrnoError();
+  }
+
+  return Nothing();
+}
+
+
 inline Result<uid_t> getuid(const Option<std::string>& user = None())
 {
   if (user.isNone()) {
@@ -654,6 +636,7 @@ inline Result<uid_t> getuid(const Option<std::string>& user = None())
           errno == ESRCH ||
           errno == EBADF ||
           errno == EPERM) {
+        delete[] buffer;
         return None();
       }
 
@@ -709,6 +692,7 @@ inline Result<gid_t> getgid(const Option<std::string>& user = None())
           errno == ESRCH ||
           errno == EBADF ||
           errno == EPERM) {
+        delete[] buffer;
         return None();
       }
 
@@ -785,7 +769,7 @@ inline Try<std::list<std::string> > find(
 {
   std::list<std::string> results;
 
-  if (!isdir(directory)) {
+  if (!stat::isdir(directory)) {
     return Error("'" + directory + "' is not a directory");
   }
 
@@ -794,7 +778,7 @@ inline Try<std::list<std::string> > find(
     foreach (const std::string& entry, entries.get()) {
       std::string path = path::join(directory, entry);
       // If it's a directory, recurse.
-      if (isdir(path) && !islink(path)) {
+      if (stat::isdir(path) && !stat::islink(path)) {
         Try<std::list<std::string> > matches = find(path, pattern);
         if (matches.isError()) {
           return matches;
@@ -854,41 +838,6 @@ inline Result<std::string> user(Option<uid_t> uid = None())
       delete[] buffer;
     }
   }
-}
-
-
-inline Try<std::string> hostname()
-{
-  char host[512];
-
-  if (gethostname(host, sizeof(host)) < 0) {
-    return ErrnoError();
-  }
-
-  // Allocate temporary buffer for gethostbyname2_r.
-  size_t length = 1024;
-  char* temp = new char[length];
-
-  struct hostent he, *hep = NULL;
-  int result = 0;
-  int herrno = 0;
-
-  while ((result = gethostbyname2_r(host, AF_INET, &he, temp,
-                                    length, &hep, &herrno)) == ERANGE) {
-    // Enlarge the buffer.
-    delete[] temp;
-    length *= 2;
-    temp = new char[length];
-  }
-
-  if (result != 0 || hep == NULL) {
-    delete[] temp;
-    return Error(hstrerror(herrno));
-  }
-
-  std::string hostname = hep->h_name;
-  delete[] temp;
-  return hostname;
 }
 
 

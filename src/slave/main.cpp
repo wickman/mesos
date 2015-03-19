@@ -20,6 +20,8 @@
 
 #include <mesos/mesos.hpp>
 
+#include <mesos/module/anonymous.hpp>
+
 #include <stout/check.hpp>
 #include <stout/flags.hpp>
 #include <stout/nothing.hpp>
@@ -29,9 +31,11 @@
 
 #include "common/build.hpp"
 
-#include "master/detector.hpp"
+#include "hook/manager.hpp"
 
 #include "logging/logging.hpp"
+
+#include "master/detector.hpp"
 
 #include "messages/messages.hpp"
 
@@ -44,7 +48,9 @@
 using namespace mesos::internal;
 using namespace mesos::internal::slave;
 
+using mesos::modules::Anonymous;
 using mesos::modules::ModuleManager;
+
 using mesos::SlaveInfo;
 
 using std::cerr;
@@ -128,6 +134,14 @@ int main(int argc, char** argv)
     }
   }
 
+  // Initialize hooks.
+  if (flags.hooks.isSome()) {
+    Try<Nothing> result = HookManager::initialize(flags.hooks.get());
+    if (result.isError()) {
+      EXIT(1) << "Error installing hooks: " << result.error();
+    }
+  }
+
   // Initialize libprocess.
   if (ip.isSome()) {
     os::setenv("LIBPROCESS_IP", ip.get());
@@ -151,15 +165,36 @@ int main(int argc, char** argv)
     LOG(INFO) << "Git SHA: " << build::GIT_SHA.get();
   }
 
-  Try<Containerizer*> containerizer = Containerizer::create(flags, false);
+  Fetcher fetcher;
+
+  Try<Containerizer*> containerizer =
+    Containerizer::create(flags, false, &fetcher);
+
   if (containerizer.isError()) {
     EXIT(1) << "Failed to create a containerizer: "
             << containerizer.error();
   }
 
   Try<MasterDetector*> detector = MasterDetector::create(master.get());
+
   if (detector.isError()) {
     EXIT(1) << "Failed to create a master detector: " << detector.error();
+  }
+
+  // Create anonymous modules.
+  foreach (const string& name, ModuleManager::find<Anonymous>()) {
+    Try<Anonymous*> create = ModuleManager::create<Anonymous>(name);
+    if (create.isError()) {
+      EXIT(1) << "Failed to create anonymous module named '" << name << "'";
+    }
+
+    // We don't bother keeping around the pointer to this anonymous
+    // module, when we exit that will effectively free it's memory.
+    //
+    // TODO(benh): We might want to add explicit finalization (and
+    // maybe explicit initialization too) in order to let the module
+    // do any housekeeping necessary when the slave is cleanly
+    // terminating.
   }
 
   LOG(INFO) << "Starting Mesos slave";
@@ -177,8 +212,8 @@ int main(int argc, char** argv)
       &statusUpdateManager);
 
   process::spawn(slave);
-
   process::wait(slave->self());
+
   delete slave;
 
   delete detector.get();

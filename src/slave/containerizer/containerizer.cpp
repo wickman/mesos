@@ -24,9 +24,11 @@
 
 #include <stout/fs.hpp>
 #include <stout/hashmap.hpp>
-#include <stout/net.hpp>
 #include <stout/stringify.hpp>
+#include <stout/strings.hpp>
 #include <stout/uuid.hpp>
+
+#include "hook/manager.hpp"
 
 #include "slave/flags.hpp"
 #include "slave/slave.hpp"
@@ -37,7 +39,6 @@
 #include "slave/containerizer/composing.hpp"
 #include "slave/containerizer/containerizer.hpp"
 #include "slave/containerizer/docker.hpp"
-#include "slave/containerizer/isolator.hpp"
 #include "slave/containerizer/launcher.hpp"
 #include "slave/containerizer/external_containerizer.hpp"
 
@@ -67,8 +68,13 @@ Try<Resources> Containerizer::resources(const Flags& flags)
 
   Resources resources = parsed.get();
 
-  // CPU resource.
-  if (!resources.cpus().isSome()) {
+  // NOTE: We need to check for the "cpus" string within the flag
+  // because once Resources are parsed, we cannot distinguish between
+  //  (1) "cpus:0", and
+  //  (2) no cpus specified.
+  // We only auto-detect cpus in case (2).
+  // The same logic applies for the other resources!
+  if (!strings::contains(flags.resources.get(""), "cpus")) {
     // No CPU specified so probe OS or resort to DEFAULT_CPUS.
     double cpus;
     Try<long> cpus_ = os::cpus();
@@ -88,7 +94,7 @@ Try<Resources> Containerizer::resources(const Flags& flags)
   }
 
   // Memory resource.
-  if (!resources.mem().isSome()) {
+  if (!strings::contains(flags.resources.get(""), "mem")) {
     // No memory specified so probe OS or resort to DEFAULT_MEM.
     Bytes mem;
     Try<os::Memory> mem_ = os::memory();
@@ -113,7 +119,7 @@ Try<Resources> Containerizer::resources(const Flags& flags)
   }
 
   // Disk resource.
-  if (!resources.disk().isSome()) {
+  if (!strings::contains(flags.resources.get(""), "disk")) {
     // No disk specified so probe OS or resort to DEFAULT_DISK.
     Bytes disk;
 
@@ -141,7 +147,7 @@ Try<Resources> Containerizer::resources(const Flags& flags)
   }
 
   // Network resource.
-  if (!resources.ports().isSome()) {
+  if (!strings::contains(flags.resources.get(""), "ports")) {
     // No ports specified so resort to DEFAULT_PORTS.
     resources += Resources::parse(
         "ports",
@@ -153,7 +159,10 @@ Try<Resources> Containerizer::resources(const Flags& flags)
 }
 
 
-Try<Containerizer*> Containerizer::create(const Flags& flags, bool local)
+Try<Containerizer*> Containerizer::create(
+    const Flags& flags,
+    bool local,
+    Fetcher* fetcher)
 {
   if (flags.isolation == "external") {
     LOG(WARNING) << "The 'external' isolation flag is deprecated, "
@@ -161,7 +170,7 @@ Try<Containerizer*> Containerizer::create(const Flags& flags, bool local)
                  << " '--containerizers=external'.";
 
     Try<ExternalContainerizer*> containerizer =
-        ExternalContainerizer::create(flags);
+      ExternalContainerizer::create(flags);
     if (containerizer.isError()) {
       return Error("Could not create ExternalContainerizer: " +
                    containerizer.error());
@@ -179,7 +188,7 @@ Try<Containerizer*> Containerizer::create(const Flags& flags, bool local)
   foreach (const string& type, strings::split(flags.containerizers, ",")) {
     if (type == "mesos") {
       Try<MesosContainerizer*> containerizer =
-        MesosContainerizer::create(flags, local);
+        MesosContainerizer::create(flags, local, fetcher);
       if (containerizer.isError()) {
         return Error("Could not create MesosContainerizer: " +
                      containerizer.error());
@@ -188,7 +197,7 @@ Try<Containerizer*> Containerizer::create(const Flags& flags, bool local)
       }
     } else if (type == "docker") {
       Try<DockerContainerizer*> containerizer =
-        DockerContainerizer::create(flags);
+        DockerContainerizer::create(flags, fetcher);
       if (containerizer.isError()) {
         return Error("Could not create DockerContainerizer: " +
                      containerizer.error());
@@ -281,42 +290,24 @@ map<string, string> executorEnvironment(
     env["MESOS_RECOVERY_TIMEOUT"] = stringify(recoveryTimeout);
   }
 
+  // Include any environment variables from Hooks.
+  // TODO(karya): Call environment decorator hook _after_ putting all
+  // variables from executorInfo into 'env'. This would prevent the
+  // ones provided by hooks from being overwritten by the ones in
+  // executorInfo in case of a conflict. The overwriting takes places
+  // at the callsites of executorEnvironment (e.g., ___launch function
+  // in src/slave/containerizer/docker.cpp)
+  // TODO(karya): Provide a mechanism to pass the new environment
+  // variables created above (MESOS_*) on to the hook modules.
+  const Environment& hooksEnvironment =
+    HookManager::slaveExecutorEnvironmentDecorator(executorInfo);
+
+  foreach (const Environment::Variable& variable,
+           hooksEnvironment.variables()) {
+    env[variable.name()] = variable.value();
+  }
+
   return env;
-}
-
-
-// Helper method to build the environment map used to launch fetcher.
-map<string, string> fetcherEnvironment(
-    const CommandInfo& commandInfo,
-    const std::string& directory,
-    const Option<std::string>& user,
-    const Flags& flags)
-{
-  // Prepare the environment variables to pass to mesos-fetcher.
-  string uris = "";
-  foreach (const CommandInfo::URI& uri, commandInfo.uris()) {
-    uris += uri.value() + "+" +
-    (uri.has_executable() && uri.executable() ? "1" : "0") +
-    (uri.extract() ? "X" : "N");
-    uris += " ";
-  }
-  // Remove extra space at the end.
-  uris = strings::trim(uris);
-
-  map<string, string> environment;
-  environment["MESOS_EXECUTOR_URIS"] = uris;
-  environment["MESOS_WORK_DIRECTORY"] = directory;
-  if (user.isSome()) {
-    environment["MESOS_USER"] = user.get();
-  }
-  if (!flags.frameworks_home.empty()) {
-    environment["MESOS_FRAMEWORKS_HOME"] = flags.frameworks_home;
-  }
-  if (!flags.hadoop_home.empty()) {
-    environment["HADOOP_HOME"] = flags.hadoop_home;
-  }
-
-  return environment;
 }
 
 

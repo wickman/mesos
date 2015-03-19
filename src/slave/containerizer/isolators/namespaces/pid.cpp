@@ -42,6 +42,11 @@ namespace mesos {
 namespace internal {
 namespace slave {
 
+using mesos::slave::ExecutorRunState;
+using mesos::slave::Isolator;
+using mesos::slave::IsolatorProcess;
+using mesos::slave::Limitation;
+
 // The root directory where we bind mount all the namespace handles.
 const string BIND_MOUNT_ROOT = "/var/run/mesos/pidns";
 
@@ -119,17 +124,12 @@ Result<ino_t> NamespacesPidIsolatorProcess::getNamespace(
 
 
 Future<Nothing> NamespacesPidIsolatorProcess::recover(
-    const list<state::RunState>& states)
+    const list<ExecutorRunState>& states)
 {
   hashset<ContainerID> containers;
 
-  foreach (const state::RunState& state, states)
-  {
-    if (!state.id.isSome()) {
-      return Failure("ContainerID required to recover");
-    }
-
-    containers.insert(state.id.get());
+  foreach (const ExecutorRunState& state, states) {
+    containers.insert(state.id);
   }
 
   // Clean up any orphaned bind mounts and empty files.
@@ -200,7 +200,7 @@ Future<Nothing> NamespacesPidIsolatorProcess::isolate(
     return Failure("Failed to create bind mount target: " + touch.error());
   }
 
-  Try<Nothing> mount = fs::mount(source, target, "none", MS_BIND, NULL);
+  Try<Nothing> mount = fs::mount(source, target, None(), MS_BIND, NULL);
   if (mount.isError()) {
     return Failure(
         "Failed to mount pid namespace handle from " +

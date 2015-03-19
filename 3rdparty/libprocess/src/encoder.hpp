@@ -2,6 +2,7 @@
 #define __ENCODER_HPP__
 
 #include <stdint.h>
+#include <time.h>
 
 #include <map>
 #include <sstream>
@@ -15,51 +16,53 @@
 #include <stout/numify.hpp>
 #include <stout/os.hpp>
 
-// NOTE: We forward declare "ev_loop" and "ev_io" here because,
-// on OSX, including "ev.h" causes conflict with "EV_ERROR" declared
-// in "/usr/include/sys/event.h".
-struct ev_loop;
-struct ev_io;
 
 namespace process {
 
 const uint32_t GZIP_MINIMUM_BODY_LENGTH = 1024;
 
-typedef void (*Sender)(struct ev_loop*, ev_io*, int);
-
-extern void send_data(struct ev_loop*, ev_io*, int);
-extern void send_file(struct ev_loop*, ev_io*, int);
+// Forward declarations.
+class Encoder;
 
 
 class Encoder
 {
 public:
-  explicit Encoder(const Socket& _s) : s(_s) {}
+  enum Kind {
+    DATA,
+    FILE
+  };
+
+  explicit Encoder(const network::Socket& _s) : s(_s) {}
   virtual ~Encoder() {}
 
-  virtual Sender sender() = 0;
+  virtual Kind kind() const = 0;
 
-  Socket socket() const
+  virtual void backup(size_t length) = 0;
+
+  virtual size_t remaining() const = 0;
+
+  network::Socket socket() const
   {
     return s;
   }
 
 private:
-  const Socket s; // The socket this encoder is associated with.
+  const network::Socket s; // The socket this encoder is associated with.
 };
 
 
 class DataEncoder : public Encoder
 {
 public:
-  DataEncoder(const Socket& s, const std::string& _data)
+  DataEncoder(const network::Socket& s, const std::string& _data)
     : Encoder(s), data(_data), index(0) {}
 
   virtual ~DataEncoder() {}
 
-  virtual Sender sender()
+  virtual Kind kind() const
   {
-    return send_data;
+    return Encoder::DATA;
   }
 
   virtual const char* next(size_t* length)
@@ -91,7 +94,7 @@ private:
 class MessageEncoder : public DataEncoder
 {
 public:
-  MessageEncoder(const Socket& s, Message* _message)
+  MessageEncoder(const network::Socket& s, Message* _message)
     : DataEncoder(s, encode(_message)), message(_message) {}
 
   virtual ~MessageEncoder()
@@ -146,7 +149,7 @@ class HttpResponseEncoder : public DataEncoder
 {
 public:
   HttpResponseEncoder(
-      const Socket& s,
+      const network::Socket& s,
       const http::Response& response,
       const http::Request& request)
     : DataEncoder(s, encode(response, request)) {}
@@ -171,8 +174,12 @@ public:
 
     char date[256];
 
+    tm tm_;
+    PCHECK(gmtime_r(&rawtime, &tm_) != NULL)
+      << "Failed to convert the current time to a tm struct using gmtime_r()";
+
     // TODO(benh): Check return code of strftime!
-    strftime(date, 256, "%a, %d %b %Y %H:%M:%S GMT", gmtime(&rawtime));
+    strftime(date, 256, "%a, %d %b %Y %H:%M:%S GMT", &tm_);
 
     headers["Date"] = date;
 
@@ -230,7 +237,7 @@ public:
 class FileEncoder : public Encoder
 {
 public:
-  FileEncoder(const Socket& s, int _fd, size_t _size)
+  FileEncoder(const network::Socket& s, int _fd, size_t _size)
     : Encoder(s), fd(_fd), size(_size), index(0) {}
 
   virtual ~FileEncoder()
@@ -238,9 +245,9 @@ public:
     os::close(fd);
   }
 
-  virtual Sender sender()
+  virtual Kind kind() const
   {
-    return send_file;
+    return Encoder::FILE;
   }
 
   virtual int next(off_t* offset, size_t* length)

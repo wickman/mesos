@@ -27,6 +27,7 @@
 #include <vector>
 
 #include <mesos/executor.hpp>
+#include <mesos/type_utils.hpp>
 
 #include <process/defer.hpp>
 #include <process/delay.hpp>
@@ -48,7 +49,6 @@
 #include <stout/strings.hpp>
 
 #include "common/http.hpp"
-#include "common/type_utils.hpp"
 #include "common/status_utils.hpp"
 
 #include "logging/logging.hpp"
@@ -56,6 +56,8 @@
 #include "messages/messages.hpp"
 
 #include "slave/constants.hpp"
+
+using namespace mesos::internal::slave;
 
 using process::wait; // Necessary on some OS's to disambiguate.
 
@@ -378,7 +380,7 @@ private:
     TaskState state;
     string message;
 
-    Timer::cancel(escalationTimer);
+    Clock::cancel(escalationTimer);
 
     if (!status_.isReady()) {
       state = TASK_FAILED;
@@ -595,10 +597,10 @@ public:
   {
     add(&override,
         "override",
-        "Whether or not to override the command the executor should run\n"
-        "when the task is launched. Only this flag is expected to be on\n"
-        "the command line and all arguments after the flag will be used as\n"
-        "the subsequent 'argv' to be used with 'execvp'",
+        "Whether to override the command the executor should run when the\n"
+        "task is launched. Only this flag is expected to be on the command\n"
+        "line and all arguments after the flag will be used as the\n"
+        "subsequent 'argv' to be used with 'execvp'",
         false);
 
     // TODO(nnielsen): Add 'prefix' option to enable replacing
@@ -619,7 +621,7 @@ int main(int argc, char** argv)
             "Prints this help message",
             false);
 
-  // Load flags from environment and command line.
+  // Load flags from command line.
   Try<Nothing> load = flags.load(None(), &argc, &argv);
 
   if (load.isError()) {

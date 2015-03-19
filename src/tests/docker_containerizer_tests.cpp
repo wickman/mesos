@@ -21,6 +21,7 @@
 
 #include <process/future.hpp>
 #include <process/gmock.hpp>
+#include <process/owned.hpp>
 #include <process/subprocess.hpp>
 
 #include <stout/duration.hpp>
@@ -33,23 +34,23 @@
 #include "tests/mesos.hpp"
 
 #include "slave/containerizer/docker.hpp"
+#include "slave/containerizer/fetcher.hpp"
+
 #include "slave/paths.hpp"
 #include "slave/slave.hpp"
 #include "slave/state.hpp"
 
-
-using namespace mesos;
-using namespace mesos::internal;
 using namespace mesos::internal::slave::paths;
 using namespace mesos::internal::slave::state;
-using namespace mesos::internal::tests;
 
 using namespace process;
 
 using mesos::internal::master::Master;
 
-using mesos::internal::slave::Slave;
 using mesos::internal::slave::DockerContainerizer;
+using mesos::internal::slave::DockerContainerizerProcess;
+using mesos::internal::slave::Fetcher;
+using mesos::internal::slave::Slave;
 
 using process::Future;
 using process::Message;
@@ -61,10 +62,15 @@ using std::list;
 using std::string;
 
 using testing::_;
+using testing::DoAll;
 using testing::DoDefault;
 using testing::Eq;
 using testing::Invoke;
 using testing::Return;
+
+namespace mesos {
+namespace internal {
+namespace tests {
 
 
 class MockDocker : public Docker
@@ -168,8 +174,20 @@ class MockDockerContainerizer : public DockerContainerizer {
 public:
   MockDockerContainerizer(
       const slave::Flags& flags,
+      Fetcher* fetcher,
       Shared<Docker> docker)
-    : DockerContainerizer(flags, docker)
+    : DockerContainerizer(flags, fetcher, docker)
+  {
+    initialize();
+  }
+
+  MockDockerContainerizer(const Owned<DockerContainerizerProcess>& process)
+    : DockerContainerizer(process)
+  {
+    initialize();
+  }
+
+  void initialize()
   {
     // NOTE: See TestContainerizer::setup for why we use
     // 'EXPECT_CALL' and 'WillRepeatedly' here instead of
@@ -266,6 +284,54 @@ public:
 };
 
 
+class MockDockerContainerizerProcess : public DockerContainerizerProcess
+{
+public:
+  MockDockerContainerizerProcess(
+      const slave::Flags& flags,
+      Fetcher* fetcher,
+      const Shared<Docker>& docker)
+    : DockerContainerizerProcess(flags, fetcher, docker)
+  {
+    EXPECT_CALL(*this, fetch(_))
+      .WillRepeatedly(Invoke(this, &MockDockerContainerizerProcess::_fetch));
+
+    EXPECT_CALL(*this, pull(_, _, _, _))
+      .WillRepeatedly(Invoke(this, &MockDockerContainerizerProcess::_pull));
+  }
+
+  MOCK_METHOD1(
+      fetch,
+      process::Future<Nothing>(const ContainerID& containerId));
+
+  MOCK_METHOD4(
+      pull,
+      process::Future<Nothing>(
+          const ContainerID& containerId,
+          const std::string& directory,
+          const std::string& image,
+          bool forcePullImage));
+
+  process::Future<Nothing> _fetch(const ContainerID& containerId)
+  {
+    return DockerContainerizerProcess::fetch(containerId);
+  }
+
+  process::Future<Nothing> _pull(
+      const ContainerID& containerId,
+      const std::string& directory,
+      const std::string& image,
+      bool forcePullImage)
+  {
+    return DockerContainerizerProcess::pull(
+        containerId,
+        directory,
+        image,
+        forcePullImage);
+  }
+};
+
+
 // Only enable executor launch on linux as other platforms
 // requires running linux VM and need special port forwarding
 // to get host networking to work.
@@ -289,7 +355,9 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_Launch_Executor)
 
   slave::Flags flags = CreateSlaveFlags();
 
-  MockDockerContainerizer dockerContainerizer(flags, docker);
+  Fetcher fetcher;
+
+  MockDockerContainerizer dockerContainerizer(flags, &fetcher, docker);
 
   Try<PID<Slave> > slave = StartSlave(&dockerContainerizer, flags);
   ASSERT_SOME(slave);
@@ -417,7 +485,9 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_Launch_Executor_Bridged)
 
   slave::Flags flags = CreateSlaveFlags();
 
-  MockDockerContainerizer dockerContainerizer(flags, docker);
+  Fetcher fetcher;
+
+  MockDockerContainerizer dockerContainerizer(flags, &fetcher, docker);
 
   Try<PID<Slave> > slave = StartSlave(&dockerContainerizer, flags);
   ASSERT_SOME(slave);
@@ -541,7 +611,9 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_Launch)
 
   slave::Flags flags = CreateSlaveFlags();
 
-  MockDockerContainerizer dockerContainerizer(flags, docker);
+  Fetcher fetcher;
+
+  MockDockerContainerizer dockerContainerizer(flags, &fetcher, docker);
 
   Try<PID<Slave> > slave = StartSlave(&dockerContainerizer, flags);
   ASSERT_SOME(slave);
@@ -654,7 +726,9 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_Kill)
 
   slave::Flags flags = CreateSlaveFlags();
 
-  MockDockerContainerizer dockerContainerizer(flags, docker);
+  Fetcher fetcher;
+
+  MockDockerContainerizer dockerContainerizer(flags, &fetcher, docker);
 
   Try<PID<Slave> > slave = StartSlave(&dockerContainerizer, flags);
   ASSERT_SOME(slave);
@@ -771,7 +845,9 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_Usage)
                            Invoke((MockDocker*) docker.get(),
                                   &MockDocker::_logs)));
 
-  MockDockerContainerizer dockerContainerizer(flags, docker);
+  Fetcher fetcher;
+
+  MockDockerContainerizer dockerContainerizer(flags, &fetcher, docker);
 
   Try<PID<Slave> > slave = StartSlave(&dockerContainerizer, flags);
   ASSERT_SOME(slave);
@@ -909,7 +985,9 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_Update)
                            Invoke((MockDocker*) docker.get(),
                                   &MockDocker::_logs)));
 
-  MockDockerContainerizer dockerContainerizer(flags, docker);
+  Fetcher fetcher;
+
+  MockDockerContainerizer dockerContainerizer(flags, &fetcher, docker);
 
   Try<PID<Slave> > slave = StartSlave(&dockerContainerizer, flags);
   ASSERT_SOME(slave);
@@ -1065,7 +1143,9 @@ TEST_F(DockerContainerizerTest, DISABLED_ROOT_DOCKER_Recover)
   MockDocker* mockDocker = new MockDocker(tests::flags.docker);
   Shared<Docker> docker(mockDocker);
 
-  MockDockerContainerizer dockerContainerizer(flags, docker);
+  Fetcher fetcher;
+
+  MockDockerContainerizer dockerContainerizer(flags, &fetcher, docker);
 
   ContainerID containerId;
   containerId.set_value("c1");
@@ -1188,7 +1268,9 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_Logs)
   EXPECT_CALL(*mockDocker, stop(_, _, _))
     .WillRepeatedly(Return(Nothing()));
 
-  MockDockerContainerizer dockerContainerizer(flags, docker);
+  Fetcher fetcher;
+
+  MockDockerContainerizer dockerContainerizer(flags, &fetcher, docker);
 
   Try<PID<Slave> > slave = StartSlave(&dockerContainerizer, flags);
   ASSERT_SOME(slave);
@@ -1314,7 +1396,9 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_Default_CMD)
   EXPECT_CALL(*mockDocker, stop(_, _, _))
     .WillRepeatedly(Return(Nothing()));
 
-  MockDockerContainerizer dockerContainerizer(flags, docker);
+  Fetcher fetcher;
+
+  MockDockerContainerizer dockerContainerizer(flags, &fetcher, docker);
 
   Try<PID<Slave> > slave = StartSlave(&dockerContainerizer, flags);
   ASSERT_SOME(slave);
@@ -1441,7 +1525,9 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_Default_CMD_Override)
   EXPECT_CALL(*mockDocker, stop(_, _, _))
     .WillRepeatedly(Return(Nothing()));
 
-  MockDockerContainerizer dockerContainerizer(flags, docker);
+  Fetcher fetcher;
+
+  MockDockerContainerizer dockerContainerizer(flags, &fetcher, docker);
 
   Try<PID<Slave> > slave = StartSlave(&dockerContainerizer, flags);
   ASSERT_SOME(slave);
@@ -1573,7 +1659,9 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_Default_CMD_Args)
   EXPECT_CALL(*mockDocker, stop(_, _, _))
     .WillRepeatedly(Return(Nothing()));
 
-  MockDockerContainerizer dockerContainerizer(flags, docker);
+  Fetcher fetcher;
+
+  MockDockerContainerizer dockerContainerizer(flags, &fetcher, docker);
 
   Try<PID<Slave> > slave = StartSlave(&dockerContainerizer, flags);
   ASSERT_SOME(slave);
@@ -1706,10 +1794,12 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_SlaveRecoveryTaskContainer)
                            Invoke((MockDocker*) docker.get(),
                                   &MockDocker::_logs)));
 
+  Fetcher fetcher;
+
   // We put the containerizer on the heap so we can more easily
   // control it's lifetime, i.e., when we invoke the destructor.
   MockDockerContainerizer* dockerContainerizer1 =
-    new MockDockerContainerizer(flags, docker);
+    new MockDockerContainerizer(flags, &fetcher, docker);
 
   Try<PID<Slave> > slave1 = StartSlave(dockerContainerizer1, flags);
   ASSERT_SOME(slave1);
@@ -1793,7 +1883,7 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_SlaveRecoveryTaskContainer)
     .WillRepeatedly(Return());       // Ignore subsequent updates.
 
   MockDockerContainerizer* dockerContainerizer2 =
-    new MockDockerContainerizer(flags, docker);
+    new MockDockerContainerizer(flags, &fetcher, docker);
 
   Try<PID<Slave> > slave2 = StartSlave(dockerContainerizer2, flags);
   ASSERT_SOME(slave2);
@@ -1877,8 +1967,10 @@ TEST_F(DockerContainerizerTest,
                            Invoke((MockDocker*) docker.get(),
                                   &MockDocker::_logs)));
 
+  Fetcher fetcher;
+
   MockDockerContainerizer* dockerContainerizer1 =
-    new MockDockerContainerizer(flags, docker);
+    new MockDockerContainerizer(flags, &fetcher, docker);
 
   Try<PID<Slave> > slave1 = StartSlave(dockerContainerizer1, flags);
   ASSERT_SOME(slave1);
@@ -1989,7 +2081,7 @@ TEST_F(DockerContainerizerTest,
     .WillRepeatedly(Return());       // Ignore subsequent updates.
 
   MockDockerContainerizer* dockerContainerizer2 =
-    new MockDockerContainerizer(flags, docker);
+    new MockDockerContainerizer(flags, &fetcher, docker);
 
   Try<PID<Slave> > slave2 = StartSlave(dockerContainerizer2, flags);
   ASSERT_SOME(slave2);
@@ -2060,7 +2152,9 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_PortMapping)
   EXPECT_CALL(*mockDocker, stop(_, _, _))
     .WillRepeatedly(Return(Nothing()));
 
-  MockDockerContainerizer dockerContainerizer(flags, docker);
+  Fetcher fetcher;
+
+  MockDockerContainerizer dockerContainerizer(flags, &fetcher, docker);
 
   Try<PID<Slave> > slave = StartSlave(&dockerContainerizer, flags);
   ASSERT_SOME(slave);
@@ -2195,7 +2289,9 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_LaunchSandboxWithColon)
     .WillRepeatedly(FutureResult(
         &logs, Invoke((MockDocker*)docker.get(), &MockDocker::_logs)));
 
-  MockDockerContainerizer dockerContainerizer(flags, docker);
+  Fetcher fetcher;
+
+  MockDockerContainerizer dockerContainerizer(flags, &fetcher, docker);
 
   Try<PID<Slave> > slave = StartSlave(&dockerContainerizer, flags);
   ASSERT_SOME(slave);
@@ -2283,3 +2379,225 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_LaunchSandboxWithColon)
 
   Shutdown();
 }
+
+
+TEST_F(DockerContainerizerTest, ROOT_DOCKER_DestroyWhileFetching)
+{
+  Try<PID<Master> > master = StartMaster();
+  ASSERT_SOME(master);
+
+  slave::Flags flags = CreateSlaveFlags();
+
+  MockDocker* mockDocker = new MockDocker(tests::flags.docker);
+  Shared<Docker> docker(mockDocker);
+
+  Fetcher fetcher;
+
+  // The docker containerizer will free the process, so we must
+  // allocate on the heap.
+  MockDockerContainerizerProcess* process =
+    new MockDockerContainerizerProcess(flags, &fetcher, docker);
+
+  MockDockerContainerizer dockerContainerizer(
+      (Owned<DockerContainerizerProcess>(process)));
+
+  Promise<Nothing> promise;
+  Future<Nothing> fetch;
+
+  // We want to pause the fetch call to simulate a long fetch time.
+  EXPECT_CALL(*process, fetch(_))
+    .WillOnce(DoAll(FutureSatisfy(&fetch),
+                    Return(promise.future())));
+
+  Try<PID<Slave> > slave = StartSlave(&dockerContainerizer);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get(), DEFAULT_CREDENTIAL);
+
+  Future<FrameworkID> frameworkId;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureArg<1>(&frameworkId));
+
+  Future<vector<Offer> > offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(frameworkId);
+
+  AWAIT_READY(offers);
+  EXPECT_NE(0u, offers.get().size());
+
+  const Offer& offer = offers.get()[0];
+
+  TaskInfo task;
+  task.set_name("");
+  task.mutable_task_id()->set_value("1");
+  task.mutable_slave_id()->CopyFrom(offer.slave_id());
+  task.mutable_resources()->CopyFrom(offer.resources());
+
+  CommandInfo command;
+  command.set_value("sleep 1000");
+
+  ContainerInfo containerInfo;
+  containerInfo.set_type(ContainerInfo::DOCKER);
+
+  ContainerInfo::DockerInfo dockerInfo;
+  dockerInfo.set_image("busybox");
+  containerInfo.mutable_docker()->CopyFrom(dockerInfo);
+
+  task.mutable_command()->CopyFrom(command);
+  task.mutable_container()->CopyFrom(containerInfo);
+
+  vector<TaskInfo> tasks;
+  tasks.push_back(task);
+
+  Future<TaskStatus> statusFailed;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusFailed));
+
+  Future<ContainerID> containerId;
+  EXPECT_CALL(dockerContainerizer, launch(_, _, _, _, _, _, _, _))
+    .WillOnce(DoAll(FutureArg<0>(&containerId),
+                    Invoke(&dockerContainerizer,
+                           &MockDockerContainerizer::_launch)));
+
+  driver.launchTasks(offers.get()[0].id(), tasks);
+
+  AWAIT_READY_FOR(containerId, Seconds(60));
+
+  AWAIT_READY(fetch);
+
+  dockerContainerizer.destroy(containerId.get());
+
+  // Resume docker launch.
+  promise.set(Nothing());
+
+  AWAIT_READY(statusFailed);
+
+  EXPECT_EQ(TASK_FAILED, statusFailed.get().state());
+
+  driver.stop();
+  driver.join();
+
+  Shutdown();
+}
+
+
+TEST_F(DockerContainerizerTest, ROOT_DOCKER_DestroyWhilePulling)
+{
+  Try<PID<Master> > master = StartMaster();
+  ASSERT_SOME(master);
+
+  slave::Flags flags = CreateSlaveFlags();
+
+  MockDocker* mockDocker = new MockDocker(tests::flags.docker);
+  Shared<Docker> docker(mockDocker);
+
+  Fetcher fetcher;
+
+  // The docker containerizer will free the process, so we must
+  // allocate on the heap.
+  MockDockerContainerizerProcess* process =
+    new MockDockerContainerizerProcess(flags, &fetcher, docker);
+
+  MockDockerContainerizer dockerContainerizer(
+      (Owned<DockerContainerizerProcess>(process)));
+
+  Future<Nothing> fetch;
+  EXPECT_CALL(*process, fetch(_))
+    .WillOnce(DoAll(FutureSatisfy(&fetch),
+                    Return(Nothing())));
+
+  Promise<Nothing> promise;
+
+  // We want to pause the fetch call to simulate a long fetch time.
+  EXPECT_CALL(*process, pull(_, _, _, _))
+    .WillOnce(Return(promise.future()));
+
+  Try<PID<Slave> > slave = StartSlave(&dockerContainerizer);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get(), DEFAULT_CREDENTIAL);
+
+  Future<FrameworkID> frameworkId;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureArg<1>(&frameworkId));
+
+  Future<vector<Offer> > offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(frameworkId);
+
+  AWAIT_READY(offers);
+  EXPECT_NE(0u, offers.get().size());
+
+  const Offer& offer = offers.get()[0];
+
+  TaskInfo task;
+  task.set_name("");
+  task.mutable_task_id()->set_value("1");
+  task.mutable_slave_id()->CopyFrom(offer.slave_id());
+  task.mutable_resources()->CopyFrom(offer.resources());
+
+  CommandInfo command;
+  command.set_value("sleep 1000");
+
+  ContainerInfo containerInfo;
+  containerInfo.set_type(ContainerInfo::DOCKER);
+
+  ContainerInfo::DockerInfo dockerInfo;
+  dockerInfo.set_image("busybox");
+  containerInfo.mutable_docker()->CopyFrom(dockerInfo);
+
+  task.mutable_command()->CopyFrom(command);
+  task.mutable_container()->CopyFrom(containerInfo);
+
+  Future<TaskStatus> statusFailed;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusFailed));
+
+  Future<ContainerID> containerId;
+  EXPECT_CALL(dockerContainerizer, launch(_, _, _, _, _, _, _, _))
+    .WillOnce(DoAll(FutureArg<0>(&containerId),
+                    Invoke(&dockerContainerizer,
+                           &MockDockerContainerizer::_launch)));
+
+  vector<TaskInfo> tasks;
+  tasks.push_back(task);
+
+  driver.launchTasks(offers.get()[0].id(), tasks);
+
+  AWAIT_READY_FOR(containerId, Seconds(60));
+
+  // Wait until fetch is finished.
+  AWAIT_READY(fetch);
+
+  dockerContainerizer.destroy(containerId.get());
+
+  // Resume docker launch.
+  promise.set(Nothing());
+
+  AWAIT_READY(statusFailed);
+
+  EXPECT_EQ(TASK_FAILED, statusFailed.get().state());
+
+  driver.stop();
+  driver.join();
+
+  Shutdown();
+}
+
+} // namespace tests {
+} // namespace internal {
+} // namespace mesos {

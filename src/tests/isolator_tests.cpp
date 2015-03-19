@@ -26,6 +26,10 @@
 
 #include <mesos/resources.hpp>
 
+#include <mesos/module/isolator.hpp>
+
+#include <mesos/slave/isolator.hpp>
+
 #include <process/future.hpp>
 #include <process/owned.hpp>
 #include <process/reap.hpp>
@@ -42,12 +46,9 @@
 #include "master/master.hpp"
 #include "master/detector.hpp"
 
-#include "module/isolator.hpp"
-
 #include "slave/flags.hpp"
 #include "slave/slave.hpp"
 
-#include "slave/containerizer/isolator.hpp"
 #ifdef __linux__
 #include "slave/containerizer/isolators/cgroups/cpushare.hpp"
 #include "slave/containerizer/isolators/cgroups/mem.hpp"
@@ -58,6 +59,7 @@
 
 #include "slave/containerizer/launcher.hpp"
 #ifdef __linux__
+#include "slave/containerizer/fetcher.hpp"
 #include "slave/containerizer/linux_launcher.hpp"
 
 #include "slave/containerizer/mesos/containerizer.hpp"
@@ -69,11 +71,6 @@
 #include "tests/module.hpp"
 #include "tests/utils.hpp"
 
-using namespace mesos;
-
-using namespace mesos::internal;
-using namespace mesos::internal::tests;
-
 using namespace process;
 
 using mesos::internal::master::Master;
@@ -81,10 +78,9 @@ using mesos::internal::master::Master;
 using mesos::internal::slave::CgroupsCpushareIsolatorProcess;
 using mesos::internal::slave::CgroupsMemIsolatorProcess;
 using mesos::internal::slave::CgroupsPerfEventIsolatorProcess;
+using mesos::internal::slave::Fetcher;
 using mesos::internal::slave::SharedFilesystemIsolatorProcess;
 #endif // __linux__
-using mesos::internal::slave::Isolator;
-using mesos::internal::slave::IsolatorProcess;
 using mesos::internal::slave::Launcher;
 using mesos::internal::slave::MesosContainerizer;
 using mesos::internal::slave::Slave;
@@ -95,6 +91,8 @@ using mesos::internal::slave::PosixLauncher;
 using mesos::internal::slave::PosixCpuIsolatorProcess;
 using mesos::internal::slave::PosixMemIsolatorProcess;
 
+using mesos::slave::Isolator;
+using mesos::slave::IsolatorProcess;
 
 using std::ostringstream;
 using std::set;
@@ -105,6 +103,10 @@ using testing::_;
 using testing::DoAll;
 using testing::Return;
 using testing::SaveArg;
+
+namespace mesos {
+namespace internal {
+namespace tests {
 
 
 static int childSetup(int pipes[2])
@@ -542,6 +544,116 @@ TEST_F(LimitedCpuIsolatorTest, ROOT_CGROUPS_Cfs_Big_Quota)
   delete launcher.get();
 }
 
+
+// A test to verify the number of processes and threads in a
+// container.
+TEST_F(LimitedCpuIsolatorTest, ROOT_CGROUPS_Pids_and_Tids)
+{
+  slave::Flags flags;
+  flags.cgroups_cpu_enable_pids_and_tids_count = true;
+
+  Try<Isolator*> isolator = CgroupsCpushareIsolatorProcess::create(flags);
+  CHECK_SOME(isolator);
+
+  Try<Launcher*> launcher = LinuxLauncher::create(flags);
+  CHECK_SOME(launcher);
+
+  ExecutorInfo executorInfo;
+  executorInfo.mutable_resources()->CopyFrom(
+      Resources::parse("cpus:0.5;mem:512").get());
+
+  ContainerID containerId;
+  containerId.set_value("mesos_test_cpu_pids_and_tids");
+
+  // Use a relative temporary directory so it gets cleaned up
+  // automatically with the test.
+  Try<string> dir = os::mkdtemp(path::join(os::getcwd(), "XXXXXX"));
+  ASSERT_SOME(dir);
+
+  AWAIT_READY(
+      isolator.get()->prepare(containerId, executorInfo, dir.get(), None()));
+
+  // Right after the creation of the cgroup, which happens in
+  // 'prepare', we check that it is empty.
+  Future<ResourceStatistics> usage = isolator.get()->usage(containerId);
+  AWAIT_READY(usage);
+  EXPECT_EQ(0U, usage.get().processes());
+  EXPECT_EQ(0U, usage.get().threads());
+
+  int pipes[2];
+  ASSERT_NE(-1, ::pipe(pipes));
+
+  vector<string> argv(3);
+  argv[0] = "sh";
+  argv[1] = "-c";
+  argv[2] = "while true; do sleep 1; done;";
+
+  Try<pid_t> pid = launcher.get()->fork(
+      containerId,
+      "/bin/sh",
+      argv,
+      Subprocess::FD(STDIN_FILENO),
+      Subprocess::FD(STDOUT_FILENO),
+      Subprocess::FD(STDERR_FILENO),
+      None(),
+      None(),
+      lambda::bind(&childSetup, pipes));
+
+  ASSERT_SOME(pid);
+
+  // Reap the forked child.
+  Future<Option<int>> status = process::reap(pid.get());
+
+  // Continue in the parent.
+  ASSERT_SOME(os::close(pipes[0]));
+
+  // Before isolation, the cgroup is empty.
+  usage = isolator.get()->usage(containerId);
+  AWAIT_READY(usage);
+  EXPECT_EQ(0U, usage.get().processes());
+  EXPECT_EQ(0U, usage.get().threads());
+
+  // Isolate the forked child.
+  AWAIT_READY(isolator.get()->isolate(containerId, pid.get()));
+
+  // After the isolation, the cgroup is not empty, even though the
+  // process hasn't exec'd yet.
+  usage = isolator.get()->usage(containerId);
+  AWAIT_READY(usage);
+  EXPECT_EQ(1U, usage.get().processes());
+  EXPECT_EQ(1U, usage.get().threads());
+
+  // Now signal the child to continue.
+  char dummy;
+  ASSERT_LT(0, ::write(pipes[1], &dummy, sizeof(dummy)));
+
+  ASSERT_SOME(os::close(pipes[1]));
+
+  // Process count should be 1 since 'sleep' is still sleeping.
+  usage = isolator.get()->usage(containerId);
+  AWAIT_READY(usage);
+  EXPECT_EQ(1U, usage.get().processes());
+  EXPECT_EQ(1U, usage.get().threads());
+
+  // Ensure all processes are killed.
+  AWAIT_READY(launcher.get()->destroy(containerId));
+
+  // Wait for the command to complete.
+  AWAIT_READY(status);
+
+  // After the process is killed, the cgroup should be empty again.
+  usage = isolator.get()->usage(containerId);
+  AWAIT_READY(usage);
+  EXPECT_EQ(0U, usage.get().processes());
+  EXPECT_EQ(0U, usage.get().threads());
+
+  // Let the isolator clean up.
+  AWAIT_READY(isolator.get()->cleanup(containerId));
+
+  delete isolator.get();
+  delete launcher.get();
+}
+
 #endif // __linux__
 
 template <typename T>
@@ -787,7 +899,7 @@ TEST_F(SharedFilesystemIsolatorTest, ROOT_RelativeVolume)
 
   // Use /var/tmp so we don't mask the work directory (under /tmp).
   const string containerPath = "/var/tmp";
-  ASSERT_TRUE(os::isdir(containerPath));
+  ASSERT_TRUE(os::stat::isdir(containerPath));
 
   // Use a host path relative to the container work directory.
   const string hostPath = strings::remove(containerPath, "/", strings::PREFIX);
@@ -952,8 +1064,10 @@ TEST_F(NamespacesPidIsolatorTest, ROOT_PidNamespace)
 
   string directory = os::getcwd(); // We're inside a temporary sandbox.
 
+  Fetcher fetcher;
+
   Try<MesosContainerizer*> containerizer =
-    MesosContainerizer::create(flags, false);
+    MesosContainerizer::create(flags, false, &fetcher);
   ASSERT_SOME(containerizer);
 
   ContainerID containerId;
@@ -1138,3 +1252,7 @@ TYPED_TEST(UserCgroupIsolatorTest, ROOT_CGROUPS_UserCgroup)
   delete isolator.get();
 }
 #endif // __linux__
+
+} // namespace tests {
+} // namespace internal {
+} // namespace mesos {

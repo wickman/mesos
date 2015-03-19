@@ -31,7 +31,15 @@
 #include <sstream>
 
 #include <mesos/mesos.hpp>
+#include <mesos/module.hpp>
 #include <mesos/scheduler.hpp>
+#include <mesos/type_utils.hpp>
+
+#include <mesos/authentication/authenticatee.hpp>
+
+#include <mesos/module/authenticatee.hpp>
+
+#include <mesos/scheduler/scheduler.hpp>
 
 #include <process/defer.hpp>
 #include <process/delay.hpp>
@@ -46,11 +54,13 @@
 #include <process/metrics/gauge.hpp>
 #include <process/metrics/metrics.hpp>
 
+#include <stout/abort.hpp>
 #include <stout/check.hpp>
 #include <stout/duration.hpp>
 #include <stout/error.hpp>
 #include <stout/flags.hpp>
 #include <stout/hashmap.hpp>
+#include <stout/ip.hpp>
 #include <stout/lambda.hpp>
 #include <stout/net.hpp>
 #include <stout/option.hpp>
@@ -62,8 +72,8 @@
 #include "authentication/cram_md5/authenticatee.hpp"
 
 #include "common/lock.hpp"
-#include "common/type_utils.hpp"
 
+#include "local/flags.hpp"
 #include "local/local.hpp"
 
 #include "logging/flags.hpp"
@@ -73,9 +83,15 @@
 
 #include "messages/messages.hpp"
 
+#include "module/manager.hpp"
+
+#include "sched/constants.hpp"
+#include "sched/flags.hpp"
+
 using namespace mesos;
 using namespace mesos::internal;
 using namespace mesos::internal::master;
+using namespace mesos::scheduler;
 
 using namespace process;
 
@@ -103,8 +119,10 @@ public:
                    Scheduler* _scheduler,
                    const FrameworkInfo& _framework,
                    const Option<Credential>& _credential,
+                   bool _implicitAcknowledgements,
                    const string& schedulerId,
                    MasterDetector* _detector,
+                   const internal::scheduler::Flags& _flags,
                    pthread_mutex_t* _mutex,
                    pthread_cond_t* _cond)
       // We use a UUID here to ensure that the master can reliably
@@ -128,6 +146,8 @@ public:
       connected(false),
       running(true),
       detector(_detector),
+      flags(_flags),
+      implicitAcknowledgements(_implicitAcknowledgements),
       credential(_credential),
       authenticatee(NULL),
       authenticating(None()),
@@ -236,13 +256,19 @@ protected:
 
       if (credential.isSome()) {
         // Authenticate with the master.
+        // TODO(vinod): Do a backoff for authentication similar to what
+        // we do for registration.
         authenticate();
       } else {
         // Proceed with registration without authentication.
         LOG(INFO) << "No credentials provided."
                   << " Attempting to register without authentication";
 
-        doReliableRegistration();
+        // TODO(vinod): Similar to the slave add a random delay to the
+        // first registration attempt too. This needs fixing tests
+        // that expect scheduler to register even with clock paused
+        // (e.g., rate limiting tests).
+        doReliableRegistration(flags.registration_backoff_factor);
       }
     } else {
       // In this case, we don't actually invoke Scheduler::error
@@ -286,7 +312,20 @@ protected:
     CHECK_SOME(credential);
 
     CHECK(authenticatee == NULL);
-    authenticatee = new cram_md5::Authenticatee(credential.get(), self());
+
+    if (flags.authenticatee == scheduler::DEFAULT_AUTHENTICATEE) {
+      LOG(INFO) << "Using default CRAM-MD5 authenticatee";
+      authenticatee = new cram_md5::CRAMMD5Authenticatee();
+    } else {
+      Try<Authenticatee*> module =
+        modules::ModuleManager::create<Authenticatee>(flags.authenticatee);
+      if (module.isError()) {
+        EXIT(1) << "Could not create authenticatee module '"
+                << flags.authenticatee << "': " << module.error();
+      }
+      LOG(INFO) << "Using '" << flags.authenticatee << "' authenticatee";
+      authenticatee = module.get();
+    }
 
     // NOTE: We do not pass 'Owned<Authenticatee>' here because doing
     // so could make 'AuthenticateeProcess' responsible for deleting
@@ -301,8 +340,9 @@ protected:
     //     'Authenticatee'.
     // --> '~Authenticatee()' is invoked by 'AuthenticateeProcess'.
     // TODO(vinod): Consider using 'Shared' to 'Owned' upgrade.
-    authenticating = authenticatee->authenticate(master.get())
-      .onAny(defer(self(), &Self::_authenticate));
+    authenticating =
+      authenticatee->authenticate(master.get(), self(), credential.get())
+        .onAny(defer(self(), &Self::_authenticate));
 
     delay(Seconds(5),
           self(),
@@ -360,7 +400,7 @@ protected:
     authenticated = true;
     authenticating = None();
 
-    doReliableRegistration(); // Proceed with registration.
+    doReliableRegistration(flags.registration_backoff_factor);
   }
 
   void authenticationTimeout(Future<bool> future)
@@ -464,7 +504,7 @@ protected:
     VLOG(1) << "Scheduler::reregistered took " << stopwatch.elapsed();
   }
 
-  void doReliableRegistration()
+  void doReliableRegistration(Duration maxBackoff)
   {
     if (!running) {
       return;
@@ -493,7 +533,29 @@ protected:
       send(master.get(), message);
     }
 
-    delay(Seconds(1), self(), &Self::doReliableRegistration);
+    // Bound the maximum backoff by 'REGISTRATION_RETRY_INTERVAL_MAX'.
+    maxBackoff =
+      std::min(maxBackoff, scheduler::REGISTRATION_RETRY_INTERVAL_MAX);
+
+    // If failover timeout is present, bound the maximum backoff
+    // by 1/10th of the failover timeout.
+    if (framework.has_failover_timeout()) {
+      Try<Duration> duration = Duration::create(framework.failover_timeout());
+      if (duration.isSome()) {
+        maxBackoff = std::min(maxBackoff, duration.get() / 10);
+      }
+    }
+
+    // Determine the delay for next attempt by picking a random
+    // duration between 0 and 'maxBackoff'.
+    // TODO(vinod): Use random numbers from <random> header.
+    Duration delay = maxBackoff * ((double) ::random() / RAND_MAX);
+
+    VLOG(1) << "Will retry registration in " << delay << " if necessary";
+
+    // Backoff.
+    process::delay(
+        delay, self(), &Self::doReliableRegistration, maxBackoff * 2);
   }
 
   void resourceOffers(
@@ -591,8 +653,6 @@ protected:
       const StatusUpdate& update,
       const UPID& pid)
   {
-    const TaskStatus& status = update.status();
-
     if (!running) {
       VLOG(1) << "Ignoring task status update message because "
               << "the driver is not running!";
@@ -630,6 +690,23 @@ protected:
     // multiple times (of course, if a scheduler re-uses a TaskID,
     // that could be bad.
 
+    TaskStatus status = update.status();
+
+    // If the update is driver-generated or master-generated, it
+    // does not require acknowledgement and so we unset the 'uuid'
+    // field of TaskStatus. Otherwise, we overwrite the field to
+    // ensure that a 0.22.0 scheduler driver supports explicit
+    // acknowledgements, even if running against a 0.21.0 cluster.
+    //
+    // TODO(bmahler): Update the slave / executor driver to ensure
+    // that 'uuid' is set accurately by the time it reaches the
+    // scheduler driver. This will be required for pure bindings.
+    if (from == UPID() || pid == UPID()) {
+      status.clear_uuid();
+    } else {
+      status.set_uuid(update.uuid());
+    }
+
     Stopwatch stopwatch;
     if (FLAGS_v >= 1) {
       stopwatch.start();
@@ -639,30 +716,32 @@ protected:
 
     VLOG(1) << "Scheduler::statusUpdate took " << stopwatch.elapsed();
 
-    // Note that we need to look at the volatile 'aborted' here to
-    // so that we don't acknowledge the update if the driver was
-    // aborted during the processing of the update.
-    if (!running) {
-      VLOG(1) << "Not sending status update acknowledgment message because "
-              << "the driver is not running!";
-      return;
-    }
+    if (implicitAcknowledgements) {
+      // Note that we need to look at the volatile 'running' here
+      // so that we don't acknowledge the update if the driver was
+      // aborted during the processing of the update.
+      if (!running) {
+        VLOG(1) << "Not sending status update acknowledgment message because "
+                << "the driver is not running!";
+        return;
+      }
 
-    // Don't acknowledge updates created by the driver or master.
-    if (from != UPID() && pid != UPID()) {
-      // We drop updates while we're disconnected.
-      CHECK(connected);
-      CHECK_SOME(master);
+      // Don't acknowledge updates created by the driver or master.
+      if (from != UPID() && pid != UPID()) {
+        // We drop updates while we're disconnected.
+        CHECK(connected);
+        CHECK_SOME(master);
 
-      VLOG(2) << "Sending ACK for status update " << update
-              << " to " << master.get();
+        VLOG(2) << "Sending ACK for status update " << update
+            << " to " << master.get();
 
-      StatusUpdateAcknowledgementMessage message;
-      message.mutable_framework_id()->MergeFrom(framework.id());
-      message.mutable_slave_id()->MergeFrom(update.slave_id());
-      message.mutable_task_id()->MergeFrom(update.status().task_id());
-      message.set_uuid(update.uuid());
-      send(master.get(), message);
+        StatusUpdateAcknowledgementMessage message;
+        message.mutable_framework_id()->MergeFrom(framework.id());
+        message.mutable_slave_id()->MergeFrom(update.slave_id());
+        message.mutable_task_id()->MergeFrom(update.status().task_id());
+        message.set_uuid(update.uuid());
+        send(master.get(), message);
+      }
     }
   }
 
@@ -899,6 +978,110 @@ protected:
     send(master.get(), message);
   }
 
+  void acceptOffers(
+      const vector<OfferID>& offerIds,
+      const vector<Offer::Operation>& operations,
+      const Filters& filters)
+  {
+    // TODO(jieyu): Move all driver side verification to master since
+    // we are moving towards supporting pure launguage scheduler.
+
+    if (!connected) {
+      VLOG(1) << "Ignoring accept offers message as master is disconnected";
+
+      // NOTE: Reply to the framework with TASK_LOST messages for each
+      // task launch. See details from notes in launchTasks.
+      // TODO(vinod): Kill this optimization in 0.22.0, to give
+      // frameworks time to implement reconciliation.
+      foreach (const Offer::Operation& operation, operations) {
+        if (operation.type() != Offer::Operation::LAUNCH) {
+          continue;
+        }
+
+        foreach (const TaskInfo& task, operation.launch().task_infos()) {
+          StatusUpdate update;
+          update.mutable_framework_id()->MergeFrom(framework.id());
+          TaskStatus* status = update.mutable_status();
+          status->mutable_task_id()->MergeFrom(task.task_id());
+          status->set_state(TASK_LOST);
+          status->set_source(TaskStatus::SOURCE_MASTER);
+          status->set_reason(TaskStatus::REASON_MASTER_DISCONNECTED);
+          status->set_message("Master Disconnected");
+          update.set_timestamp(Clock::now().secs());
+          update.set_uuid(UUID::random().toBytes());
+
+          statusUpdate(UPID(), update, UPID());
+        }
+      }
+      return;
+    }
+
+    Call message;
+    message.mutable_framework_info()->CopyFrom(framework);
+    message.set_type(Call::ACCEPT);
+
+    Call::Accept* accept = message.mutable_accept();
+
+    // Setting accept.operations.
+    foreach (const Offer::Operation& _operation, operations) {
+      Offer::Operation* operation = accept->add_operations();
+      operation->CopyFrom(_operation);
+
+      if (operation->type() != Offer::Operation::LAUNCH) {
+        continue;
+      }
+
+      // Set TaskInfo.executor.framework_id, if it's missing.
+      foreach (TaskInfo& task,
+               *operation->mutable_launch()->mutable_task_infos()) {
+        if (task.has_executor() && !task.executor().has_framework_id()) {
+          task.mutable_executor()->mutable_framework_id()->CopyFrom(
+              framework.id());
+        }
+      }
+    }
+
+    // Setting accept.offer_ids.
+    foreach (const OfferID& offerId, offerIds) {
+      accept->add_offer_ids()->CopyFrom(offerId);
+
+      if (!savedOffers.contains(offerId)) {
+        // TODO(jieyu): A duplicated offer ID could also cause this
+        // warning being printed. Consider refine this message here
+        // and in launchTasks as well.
+        LOG(WARNING) << "Attempting to accept an unknown offer " << offerId;
+      } else {
+        // Keep only the slave PIDs where we run tasks so we can send
+        // framework messages directly.
+        foreach (const Offer::Operation& operation, operations) {
+          if (operation.type() != Offer::Operation::LAUNCH) {
+            continue;
+          }
+
+          foreach (const TaskInfo& task, operation.launch().task_infos()) {
+            const SlaveID& slaveId = task.slave_id();
+
+            if (savedOffers[offerId].contains(slaveId)) {
+              savedSlavePids[slaveId] = savedOffers[offerId][slaveId];
+            } else {
+              LOG(WARNING) << "Attempting to launch task " << task.task_id()
+                           << " with the wrong slave id " << slaveId;
+            }
+          }
+        }
+      }
+
+      // Remove the offer since we saved all the PIDs we might use.
+      savedOffers.erase(offerId);
+    }
+
+    // Setting accept.filters.
+    accept->mutable_filters()->CopyFrom(filters);
+
+    CHECK_SOME(master);
+    send(master.get(), message);
+  }
+
   void reviveOffers()
   {
     if (!connected) {
@@ -910,6 +1093,53 @@ protected:
     message.mutable_framework_id()->MergeFrom(framework.id());
     CHECK_SOME(master);
     send(master.get(), message);
+  }
+
+  void acknowledgeStatusUpdate(
+      const TaskStatus& status)
+  {
+    // The driver should abort before allowing an acknowledgement
+    // call when implicit acknowledgements are enabled. We further
+    // enforce that the driver is denying the call through this CHECK.
+    CHECK(!implicitAcknowledgements);
+
+    if (!connected) {
+      VLOG(1) << "Ignoring explicit status update acknowledgement"
+                 " because the driver is disconnected";
+      return;
+    }
+
+    CHECK_SOME(master);
+
+    // NOTE: By ignoring the volatile 'running' here, we ensure that
+    // all acknowledgements requested before the driver was stopped
+    // or aborted are processed. Any acknowledgement that is requested
+    // after the driver stops or aborts (running == false) will be
+    // dropped in the driver before reaching here.
+
+    // Only statuses with a 'uuid' and a 'slave_id' need to have
+    // acknowledgements sent to the master. Note that the driver
+    // ensures that master-generated and driver-generated updates
+    // will not have a 'uuid' set.
+    if (status.has_uuid() && status.has_slave_id()) {
+      VLOG(2) << "Sending ACK for status update " << status.uuid()
+              << " of task " << status.task_id()
+              << " on slave " << status.slave_id()
+              << " to " << master.get();
+
+      StatusUpdateAcknowledgementMessage message;
+      message.mutable_framework_id()->CopyFrom(framework.id());
+      message.mutable_slave_id()->CopyFrom(status.slave_id());
+      message.mutable_task_id()->CopyFrom(status.task_id());
+      message.set_uuid(status.uuid());
+      send(master.get(), message);
+    } else {
+      VLOG(2) << "Received ACK for status update"
+              << (status.has_uuid() ? " " + status.uuid() : "")
+              << " of task " << status.task_id()
+              << (status.has_slave_id()
+                  ? " on slave " + stringify(status.slave_id()) : "");
+    }
   }
 
   void sendFrameworkMessage(const ExecutorID& executorId,
@@ -1039,12 +1269,21 @@ private:
 
   MasterDetector* detector;
 
+  const internal::scheduler::Flags flags;
+
   hashmap<OfferID, hashmap<SlaveID, UPID> > savedOffers;
   hashmap<SlaveID, UPID> savedSlavePids;
 
+  // The driver optionally provides implicit acknowledgements
+  // for frameworks. If disabled, the framework must send its
+  // own acknowledgements through the driver, when the 'uuid'
+  // of the TaskStatus is set (which also implies the 'slave_id'
+  // is set).
+  bool implicitAcknowledgements;
+
   const Option<Credential> credential;
 
-  cram_md5::Authenticatee* authenticatee;
+  Authenticatee* authenticatee;
 
   // Indicates if an authentication attempt is in progress.
   Option<Future<bool> > authenticating;
@@ -1069,7 +1308,6 @@ void MesosSchedulerDriver::initialize() {
   // we'll probably want a way to load master::Flags and slave::Flags
   // as well.
   local::Flags flags;
-
   Try<Nothing> load = flags.load("MESOS_");
 
   if (load.isError()) {
@@ -1081,7 +1319,7 @@ void MesosSchedulerDriver::initialize() {
   // Initialize libprocess.
   process::initialize(schedulerId);
 
-  if (stringify(net::IP(ntohl(process::ip()))) == "127.0.0.1") {
+  if (process::address().ip.isLoopback()) {
     LOG(WARNING) << "\n**************************************************\n"
                  << "Scheduler driver bound to loopback interface!"
                  << " Cannot communicate with remote master(s)."
@@ -1120,7 +1358,7 @@ void MesosSchedulerDriver::initialize() {
     framework.set_user(user.get());
   }
   if (framework.hostname().empty()) {
-    framework.set_hostname(os::hostname().get());
+    framework.set_hostname(net::hostname().get());
   }
 
   // Launch a local cluster if necessary.
@@ -1133,6 +1371,7 @@ void MesosSchedulerDriver::initialize() {
 
   url = pid.isSome() ? static_cast<string>(pid.get()) : master;
 }
+
 
 // Implementation of C++ API.
 //
@@ -1158,6 +1397,7 @@ MesosSchedulerDriver::MesosSchedulerDriver(
     master(_master),
     process(NULL),
     status(DRIVER_NOT_STARTED),
+    implicitAcknowlegements(true),
     credential(NULL),
     schedulerId("scheduler-" + UUID::random().toString())
 {
@@ -1165,8 +1405,6 @@ MesosSchedulerDriver::MesosSchedulerDriver(
 }
 
 
-// The implementation of this is same as the above constructor
-// except that the SchedulerProcess is passed the credential.
 MesosSchedulerDriver::MesosSchedulerDriver(
     Scheduler* _scheduler,
     const FrameworkInfo& _framework,
@@ -1178,6 +1416,46 @@ MesosSchedulerDriver::MesosSchedulerDriver(
     master(_master),
     process(NULL),
     status(DRIVER_NOT_STARTED),
+    implicitAcknowlegements(true),
+    credential(new Credential(_credential)),
+    schedulerId("scheduler-" + UUID::random().toString())
+{
+  initialize();
+}
+
+
+MesosSchedulerDriver::MesosSchedulerDriver(
+    Scheduler* _scheduler,
+    const FrameworkInfo& _framework,
+    const string& _master,
+    bool _implicitAcknowlegements)
+  : detector(NULL),
+    scheduler(_scheduler),
+    framework(_framework),
+    master(_master),
+    process(NULL),
+    status(DRIVER_NOT_STARTED),
+    implicitAcknowlegements(_implicitAcknowlegements),
+    credential(NULL),
+    schedulerId("scheduler-" + UUID::random().toString())
+{
+  initialize();
+}
+
+
+MesosSchedulerDriver::MesosSchedulerDriver(
+    Scheduler* _scheduler,
+    const FrameworkInfo& _framework,
+    const string& _master,
+    bool _implicitAcknowlegements,
+    const Credential& _credential)
+  : detector(NULL),
+    scheduler(_scheduler),
+    framework(_framework),
+    master(_master),
+    process(NULL),
+    status(DRIVER_NOT_STARTED),
+    implicitAcknowlegements(_implicitAcknowlegements),
     credential(new Credential(_credential)),
     schedulerId("scheduler-" + UUID::random().toString())
 {
@@ -1248,6 +1526,27 @@ Status MesosSchedulerDriver::start()
     detector = detector_.get();
   }
 
+  // Load scheduler flags.
+  internal::scheduler::Flags flags;
+  Try<Nothing> load = flags.load("MESOS_");
+
+  if (load.isError()) {
+    status = DRIVER_ABORTED;
+    scheduler->error(this, load.error());
+    return status;
+  }
+
+  // Initialize modules. Note that since other subsystems may depend
+  // upon modules, we should initialize modules before anything else.
+  if (flags.modules.isSome()) {
+    Try<Nothing> result = modules::ModuleManager::load(flags.modules.get());
+    if (result.isError()) {
+      status = DRIVER_ABORTED;
+      scheduler->error(this, "Error loading modules: " + result.error());
+      return status;
+    }
+  }
+
   CHECK(process == NULL);
 
   if (credential == NULL) {
@@ -1256,8 +1555,10 @@ Status MesosSchedulerDriver::start()
         scheduler,
         framework,
         None(),
+        implicitAcknowlegements,
         schedulerId,
         detector,
+        flags,
         &mutex,
         &cond);
   } else {
@@ -1267,8 +1568,10 @@ Status MesosSchedulerDriver::start()
         scheduler,
         framework,
         cred,
+        implicitAcknowlegements,
         schedulerId,
         detector,
+        flags,
         &mutex,
         &cond);
   }
@@ -1409,6 +1712,30 @@ Status MesosSchedulerDriver::launchTasks(
 }
 
 
+Status MesosSchedulerDriver::acceptOffers(
+    const vector<OfferID>& offerIds,
+    const vector<Offer::Operation>& operations,
+    const Filters& filters)
+{
+  Lock lock(&mutex);
+
+  if (status != DRIVER_RUNNING) {
+    return status;
+  }
+
+  CHECK(process != NULL);
+
+  dispatch(
+      process,
+      &SchedulerProcess::acceptOffers,
+      offerIds,
+      operations,
+      filters);
+
+  return status;
+}
+
+
 Status MesosSchedulerDriver::declineOffer(
     const OfferID& offerId,
     const Filters& filters)
@@ -1431,6 +1758,29 @@ Status MesosSchedulerDriver::reviveOffers()
   CHECK(process != NULL);
 
   dispatch(process, &SchedulerProcess::reviveOffers);
+
+  return status;
+}
+
+
+Status MesosSchedulerDriver::acknowledgeStatusUpdate(
+    const TaskStatus& taskStatus)
+{
+  Lock lock(&mutex);
+
+  if (status != DRIVER_RUNNING) {
+    return status;
+  }
+
+  // TODO(bmahler): Should this use abort() instead?
+  if (implicitAcknowlegements) {
+    ABORT("Cannot call acknowledgeStatusUpdate:"
+          " Implicit acknowledgements are enabled");
+  }
+
+  CHECK(process != NULL);
+
+  dispatch(process, &SchedulerProcess::acknowledgeStatusUpdate, taskStatus);
 
   return status;
 }

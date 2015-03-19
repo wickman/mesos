@@ -21,6 +21,7 @@
 #include <vector>
 
 #include <mesos/resources.hpp>
+#include <mesos/type_utils.hpp>
 #include <mesos/values.hpp>
 
 #include <process/collect.hpp>
@@ -38,8 +39,6 @@
 #include <stout/stringify.hpp>
 #include <stout/try.hpp>
 
-#include "common/type_utils.hpp"
-
 #include "linux/cgroups.hpp"
 
 #include "slave/containerizer/isolators/cgroups/mem.hpp"
@@ -55,6 +54,11 @@ using std::vector;
 namespace mesos {
 namespace internal {
 namespace slave {
+
+using mesos::slave::ExecutorRunState;
+using mesos::slave::Isolator;
+using mesos::slave::IsolatorProcess;
+using mesos::slave::Limitation;
 
 
 template<class T>
@@ -132,20 +136,12 @@ Try<Isolator*> CgroupsMemIsolatorProcess::create(const Flags& flags)
 
 
 Future<Nothing> CgroupsMemIsolatorProcess::recover(
-    const list<state::RunState>& states)
+    const list<ExecutorRunState>& states)
 {
   hashset<string> cgroups;
 
-  foreach (const state::RunState& state, states) {
-    if (state.id.isNone()) {
-      foreachvalue (Info* info, infos) {
-        delete info;
-      }
-      infos.clear();
-      return Failure("ContainerID is required to recover");
-    }
-
-    const ContainerID& containerId = state.id.get();
+  foreach (const ExecutorRunState& state, states) {
+    const ContainerID& containerId = state.id;
     const string cgroup = path::join(flags.cgroups_root, containerId.value());
 
     Try<bool> exists = cgroups::exists(hierarchy, cgroup);
@@ -324,32 +320,14 @@ Future<Nothing> CgroupsMemIsolatorProcess::update(
             << " for container " << containerId;
 
   // Read the existing limit.
-  Bytes currentLimit;
+  Try<Bytes> currentLimit =
+    cgroups::memory::limit_in_bytes(hierarchy, info->cgroup);
 
-  if (limitSwap) {
-    Result<Bytes> _currentLimit =
-      cgroups::memory::memsw_limit_in_bytes(hierarchy, info->cgroup);
-
-    if (_currentLimit.isError()) {
-      return Failure(
-          "Failed to read 'memory.memsw.limit_in_bytes': " +
-          _currentLimit.error());
-    } else if (_currentLimit.isNone()) {
-      return Failure("'memory.memsw.limit_in_bytes' is not available");
-    }
-
-    currentLimit = _currentLimit.get();
-  } else {
-    Try<Bytes> _currentLimit =
-      cgroups::memory::limit_in_bytes(hierarchy, info->cgroup);
-
-    if (_currentLimit.isError()) {
-      return Failure(
-          "Failed to read 'memory.limit_in_bytes': " +
-          _currentLimit.error());
-    }
-
-    currentLimit = _currentLimit.get();
+  // NOTE: If limitSwap is (has been) used then both limit_in_bytes
+  // and memsw.limit_in_bytes will always be set to the same value.
+  if (currentLimit.isError()) {
+    return Failure(
+        "Failed to read 'memory.limit_in_bytes': " + currentLimit.error());
   }
 
   // Determine whether to set the hard limit. If this is the first
@@ -362,7 +340,20 @@ Future<Nothing> CgroupsMemIsolatorProcess::update(
   // TODO(benh): Introduce a MemoryWatcherProcess which monitors the
   // discrepancy between usage and soft limit and introduces a "manual
   // oom" if necessary.
-  if (info->pid.isNone() || limit > currentLimit) {
+  if (info->pid.isNone() || limit > currentLimit.get()) {
+    // We always set limit_in_bytes first and optionally set
+    // memsw.limit_in_bytes if limitSwap is true.
+    Try<Nothing> write = cgroups::memory::limit_in_bytes(
+        hierarchy, info->cgroup, limit);
+
+    if (write.isError()) {
+      return Failure(
+          "Failed to set 'memory.limit_in_bytes': " + write.error());
+    }
+
+    LOG(INFO) << "Updated 'memory.limit_in_bytes' to " << limit
+              << " for container " << containerId;
+
     if (limitSwap) {
       Try<bool> write = cgroups::memory::memsw_limit_in_bytes(
           hierarchy, info->cgroup, limit);
@@ -370,22 +361,9 @@ Future<Nothing> CgroupsMemIsolatorProcess::update(
       if (write.isError()) {
         return Failure(
             "Failed to set 'memory.memsw.limit_in_bytes': " + write.error());
-      } else if (!write.get()) {
-        return Failure("'memory.memsw.limit_in_bytes' is not available");
       }
 
       LOG(INFO) << "Updated 'memory.memsw.limit_in_bytes' to " << limit
-                << " for container " << containerId;
-    } else {
-      Try<Nothing> write = cgroups::memory::limit_in_bytes(
-          hierarchy, info->cgroup, limit);
-
-      if (write.isError()) {
-        return Failure(
-            "Failed to set 'memory.limit_in_bytes': " + write.error());
-      }
-
-      LOG(INFO) << "Updated 'memory.limit_in_bytes' to " << limit
                 << " for container " << containerId;
     }
   }
@@ -557,28 +535,15 @@ void CgroupsMemIsolatorProcess::oom(const ContainerID& containerId)
   message << "Memory limit exceeded: ";
 
   // Output the requested memory limit.
-  if (limitSwap) {
-    Result<Bytes> limit =
-      cgroups::memory::memsw_limit_in_bytes(hierarchy, info->cgroup);
+  // NOTE: If limitSwap is (has been) used then both limit_in_bytes
+  // and memsw.limit_in_bytes will always be set to the same value.
+  Try<Bytes> limit = cgroups::memory::limit_in_bytes(hierarchy, info->cgroup);
 
-    if (limit.isError()) {
-      LOG(ERROR) << "Failed to read 'memory.memsw.limit_in_bytes': "
-                 << limit.error();
-    } else if (limit.isNone()) {
-      LOG(ERROR) << "'memory.memsw.limit_in_bytes' is not available";
-    } else {
-      message << "Requested: " << limit.get() << " ";
-    }
+  if (limit.isError()) {
+    LOG(ERROR) << "Failed to read 'memory.limit_in_bytes': "
+               << limit.error();
   } else {
-    Try<Bytes> limit =
-      cgroups::memory::limit_in_bytes(hierarchy, info->cgroup);
-
-    if (limit.isError()) {
-      LOG(ERROR) << "Failed to read 'memory.limit_in_bytes': "
-                 << limit.error();
-    } else {
-      message << "Requested: " << limit.get() << " ";
-    }
+    message << "Requested: " << limit.get() << " ";
   }
 
   // Output the maximum memory usage.
@@ -604,7 +569,10 @@ void CgroupsMemIsolatorProcess::oom(const ContainerID& containerId)
 
   LOG(INFO) << strings::trim(message.str()); // Trim the extra '\n' at the end.
 
-  Resource mem = Resources::parse(
+  // TODO(jieyu): This is not accurate if the memory resource is from
+  // a non-star role or spans roles (e.g., "*" and "role"). Ideally,
+  // we should save the resources passed in and report it here.
+  Resources mem = Resources::parse(
       "mem",
       stringify(usage.isSome() ? usage.get().megabytes() : 0),
       "*").get();

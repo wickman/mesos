@@ -22,6 +22,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <vector>
 
 #include <mesos/executor.hpp>
 #include <mesos/scheduler.hpp>
@@ -33,6 +34,8 @@
 #include <process/pid.hpp>
 #include <process/process.hpp>
 
+#include <stout/bytes.hpp>
+#include <stout/foreach.hpp>
 #include <stout/gtest.hpp>
 #include <stout/lambda.hpp>
 #include <stout/none.hpp>
@@ -45,10 +48,10 @@
 
 #include "messages/messages.hpp" // For google::protobuf::Message.
 
-#include "master/allocator.hpp"
 #include "master/detector.hpp"
-#include "master/hierarchical_allocator_process.hpp"
 #include "master/master.hpp"
+
+#include "master/allocator/allocator.hpp"
 
 #include "slave/slave.hpp"
 
@@ -57,11 +60,17 @@
 #include "slave/containerizer/mesos/containerizer.hpp"
 
 #include "tests/cluster.hpp"
+#include "tests/limiter.hpp"
 #include "tests/utils.hpp"
 
 #ifdef MESOS_HAS_JAVA
 #include "tests/zookeeper.hpp"
 #endif // MESOS_HAS_JAVA
+
+using ::testing::_;
+using ::testing::An;
+using ::testing::DoDefault;
+using ::testing::Return;
 
 namespace mesos {
 namespace internal {
@@ -90,7 +99,7 @@ protected:
 
   // Starts a master with the specified allocator process and flags.
   virtual Try<process::PID<master::Master> > StartMaster(
-      master::allocator::AllocatorProcess* allocator,
+      master::allocator::Allocator* allocator,
       const Option<master::Flags>& flags = None());
 
   // Starts a master with the specified authorizer and flags.
@@ -98,6 +107,11 @@ protected:
   // returning if 'wait' is set to true.
   virtual Try<process::PID<master::Master> > StartMaster(
       Authorizer* authorizer,
+      const Option<master::Flags>& flags = None());
+
+  // Starts a master with a slave removal rate limiter and flags.
+  virtual Try<process::PID<master::Master> > StartMaster(
+      const memory::shared_ptr<MockRateLimiter>& slaveRemovalLimiter,
       const Option<master::Flags>& flags = None());
 
   // TODO(bmahler): Consider adding a builder style interface, e.g.
@@ -359,6 +373,87 @@ inline TaskInfo createTask(
 }
 
 
+// NOTE: We only set the volume in DiskInfo if 'containerPath' is set.
+// If volume mode is not specified, Volume::RW will be used (assuming
+// 'containerPath' is set).
+inline Resource::DiskInfo createDiskInfo(
+    const Option<std::string>& persistenceId,
+    const Option<std::string>& containerPath,
+    const Option<Volume::Mode>& mode = None(),
+    const Option<std::string>& hostPath = None())
+{
+  Resource::DiskInfo info;
+
+  if (persistenceId.isSome()) {
+    info.mutable_persistence()->set_id(persistenceId.get());
+  }
+
+  if (containerPath.isSome()) {
+    Volume volume;
+    volume.set_container_path(containerPath.get());
+    volume.set_mode(mode.isSome() ? mode.get() : Volume::RW);
+
+    if (hostPath.isSome()) {
+      volume.set_host_path(hostPath.get());
+    }
+
+    info.mutable_volume()->CopyFrom(volume);
+  }
+
+  return info;
+}
+
+
+inline Resource createPersistentVolume(
+    const Bytes& size,
+    const std::string& role,
+    const std::string& persistenceId,
+    const std::string& containerPath)
+{
+  Resource volume = Resources::parse(
+      "disk",
+      stringify(size.megabytes()),
+      role).get();
+
+  volume.mutable_disk()->CopyFrom(
+      createDiskInfo(persistenceId, containerPath));
+
+  return volume;
+}
+
+
+// Helpers for creating offer operations.
+inline Offer::Operation CREATE(const Resources& volumes)
+{
+  Offer::Operation operation;
+  operation.set_type(Offer::Operation::CREATE);
+  operation.mutable_create()->mutable_volumes()->CopyFrom(volumes);
+  return operation;
+}
+
+
+inline Offer::Operation DESTROY(const Resources& volumes)
+{
+  Offer::Operation operation;
+  operation.set_type(Offer::Operation::DESTROY);
+  operation.mutable_destroy()->mutable_volumes()->CopyFrom(volumes);
+  return operation;
+}
+
+
+inline Offer::Operation LAUNCH(const std::vector<TaskInfo>& tasks)
+{
+  Offer::Operation operation;
+  operation.set_type(Offer::Operation::LAUNCH);
+
+  foreach (const TaskInfo& task, tasks) {
+    operation.mutable_launch()->add_task_infos()->CopyFrom(task);
+  }
+
+  return operation;
+}
+
+
 // Definition of a mock Scheduler to be used in tests with gmock.
 class MockScheduler : public Scheduler
 {
@@ -406,15 +501,19 @@ ACTION_P5(LaunchTasks, executor, tasks, cpus, mem, role)
     std::vector<TaskInfo> tasks;
     Resources remaining = offer.resources();
 
-    while (TASK_RESOURCES <= remaining.flatten() && launched < numTasks) {
+    while (remaining.flatten().contains(TASK_RESOURCES) &&
+           launched < numTasks) {
       TaskInfo task;
       task.set_name("TestTask");
       task.mutable_task_id()->set_value(stringify(nextTaskId++));
       task.mutable_slave_id()->MergeFrom(offer.slave_id());
       task.mutable_executor()->MergeFrom(executor);
 
-      Option<Resources> resources = remaining.find(TASK_RESOURCES, role);
+      Option<Resources> resources =
+        remaining.find(TASK_RESOURCES.flatten(role));
+
       CHECK_SOME(resources);
+
       task.mutable_resources()->MergeFrom(resources.get());
       remaining -= resources.get();
 
@@ -479,24 +578,44 @@ class TestingMesosSchedulerDriver : public MesosSchedulerDriver
 public:
   TestingMesosSchedulerDriver(
       Scheduler* scheduler,
-      const FrameworkInfo& framework,
-      const Credential& credential,
-      MasterDetector* _detector)
-    : MesosSchedulerDriver(scheduler, framework, "", credential)
-  {
-    detector = _detector;
-  }
-
-  // A constructor that uses the DEFAULT_FRAMEWORK_INFO &
-  // DEFAULT_CREDENTIAL.
-  TestingMesosSchedulerDriver(
-      Scheduler* scheduler,
       MasterDetector* _detector)
     : MesosSchedulerDriver(
           scheduler,
           DEFAULT_FRAMEWORK_INFO,
           "",
+          true,
           DEFAULT_CREDENTIAL)
+  {
+    detector = _detector;
+  }
+
+  TestingMesosSchedulerDriver(
+      Scheduler* scheduler,
+      MasterDetector* _detector,
+      const FrameworkInfo& framework,
+      bool implicitAcknowledgements = true)
+    : MesosSchedulerDriver(
+          scheduler,
+          framework,
+          "",
+          implicitAcknowledgements,
+          DEFAULT_CREDENTIAL)
+  {
+    detector = _detector;
+  }
+
+  TestingMesosSchedulerDriver(
+      Scheduler* scheduler,
+      MasterDetector* _detector,
+      const FrameworkInfo& framework,
+      bool implicitAcknowledgements,
+      const Credential& credential)
+    : MesosSchedulerDriver(
+          scheduler,
+          framework,
+          "",
+          implicitAcknowledgements,
+          credential)
   {
     detector = _detector;
   }
@@ -518,9 +637,6 @@ class MockGarbageCollector : public slave::GarbageCollector
 public:
   MockGarbageCollector()
   {
-    using ::testing::_;
-    using ::testing::Return;
-
     // NOTE: We use 'EXPECT_CALL' and 'WillRepeatedly' here instead of
     // 'ON_CALL' and 'WillByDefault'. See 'TestContainerizer::SetUp()'
     // for more details.
@@ -602,6 +718,12 @@ public:
   void unmocked_removeFramework(
       slave::Framework* framework);
 
+  MOCK_METHOD1(__recover, void(
+      const process::Future<Nothing>& future));
+
+  void unmocked___recover(
+      const process::Future<Nothing>& future);
+
 private:
   Files files;
   MockGarbageCollector gc;
@@ -615,9 +737,6 @@ class MockAuthorizer : public Authorizer
 public:
   MockAuthorizer()
   {
-    using ::testing::An;
-    using ::testing::Return;
-
     // NOTE: We use 'EXPECT_CALL' and 'WillRepeatedly' here instead of
     // 'ON_CALL' and 'WillByDefault'. See 'TestContainerizer::SetUp()'
     // for more details.
@@ -640,241 +759,250 @@ public:
 };
 
 
-template <typename T = master::allocator::AllocatorProcess>
-class MockAllocatorProcess : public master::allocator::AllocatorProcess
+template <typename T = master::allocator::Allocator>
+class TestAllocator : public master::allocator::Allocator
 {
 public:
-  MockAllocatorProcess()
+  TestAllocator()
   {
-    // Spawn the underlying allocator process.
-    process::spawn(real);
-
-    using ::testing::_;
+    // We use 'ON_CALL' and 'WillByDefault' here to specify the
+    // default actions (call in to the real allocator). This allows
+    // the tests to leverage the 'DoDefault' action.
+    // However, 'ON_CALL' results in a "Uninteresting mock function
+    // call" warning unless each test puts expectations in place.
+    // As a result, we also use 'EXPECT_CALL' and 'WillRepeatedly'
+    // to get the best of both worlds: the ability to use 'DoDefault'
+    // and no warnings when expectations are not explicit.
 
     ON_CALL(*this, initialize(_, _, _))
       .WillByDefault(InvokeInitialize(this));
+    EXPECT_CALL(*this, initialize(_, _, _))
+      .WillRepeatedly(DoDefault());
 
-    ON_CALL(*this, frameworkAdded(_, _, _))
-      .WillByDefault(InvokeFrameworkAdded(this));
+    ON_CALL(*this, addFramework(_, _, _))
+      .WillByDefault(InvokeAddFramework(this));
+    EXPECT_CALL(*this, addFramework(_, _, _))
+      .WillRepeatedly(DoDefault());
 
-    ON_CALL(*this, frameworkRemoved(_))
-      .WillByDefault(InvokeFrameworkRemoved(this));
+    ON_CALL(*this, removeFramework(_))
+      .WillByDefault(InvokeRemoveFramework(this));
+    EXPECT_CALL(*this, removeFramework(_))
+      .WillRepeatedly(DoDefault());
 
-    ON_CALL(*this, frameworkActivated(_, _))
-      .WillByDefault(InvokeFrameworkActivated(this));
+    ON_CALL(*this, activateFramework(_))
+      .WillByDefault(InvokeActivateFramework(this));
+    EXPECT_CALL(*this, activateFramework(_))
+      .WillRepeatedly(DoDefault());
 
-    ON_CALL(*this, frameworkDeactivated(_))
-      .WillByDefault(InvokeFrameworkDeactivated(this));
+    ON_CALL(*this, deactivateFramework(_))
+      .WillByDefault(InvokeDeactivateFramework(this));
+    EXPECT_CALL(*this, deactivateFramework(_))
+      .WillRepeatedly(DoDefault());
 
-    ON_CALL(*this, slaveAdded(_, _, _))
-      .WillByDefault(InvokeSlaveAdded(this));
+    ON_CALL(*this, addSlave(_, _, _, _))
+      .WillByDefault(InvokeAddSlave(this));
+    EXPECT_CALL(*this, addSlave(_, _, _, _))
+      .WillRepeatedly(DoDefault());
 
-    ON_CALL(*this, slaveRemoved(_))
-      .WillByDefault(InvokeSlaveRemoved(this));
+    ON_CALL(*this, removeSlave(_))
+      .WillByDefault(InvokeRemoveSlave(this));
+    EXPECT_CALL(*this, removeSlave(_))
+      .WillRepeatedly(DoDefault());
 
-    ON_CALL(*this, slaveDeactivated(_))
-      .WillByDefault(InvokeSlaveDeactivated(this));
+    ON_CALL(*this, activateSlave(_))
+      .WillByDefault(InvokeActivateSlave(this));
+    EXPECT_CALL(*this, activateSlave(_))
+      .WillRepeatedly(DoDefault());
 
-    ON_CALL(*this, slaveActivated(_))
-      .WillByDefault(InvokeSlaveReactivated(this));
+    ON_CALL(*this, deactivateSlave(_))
+      .WillByDefault(InvokeDeactivateSlave(this));
+    EXPECT_CALL(*this, deactivateSlave(_))
+      .WillRepeatedly(DoDefault());
 
     ON_CALL(*this, updateWhitelist(_))
       .WillByDefault(InvokeUpdateWhitelist(this));
+    EXPECT_CALL(*this, updateWhitelist(_))
+      .WillRepeatedly(DoDefault());
 
-    ON_CALL(*this, resourcesRequested(_, _))
-      .WillByDefault(InvokeResourcesRequested(this));
+    ON_CALL(*this, requestResources(_, _))
+      .WillByDefault(InvokeRequestResources(this));
+    EXPECT_CALL(*this, requestResources(_, _))
+      .WillRepeatedly(DoDefault());
 
-    ON_CALL(*this, resourcesRecovered(_, _, _, _))
-      .WillByDefault(InvokeResourcesRecovered(this));
+    ON_CALL(*this, updateAllocation(_, _, _))
+      .WillByDefault(InvokeUpdateAllocation(this));
+    EXPECT_CALL(*this, updateAllocation(_, _, _))
+      .WillRepeatedly(DoDefault());
 
-    ON_CALL(*this, offersRevived(_))
-      .WillByDefault(InvokeOffersRevived(this));
+    ON_CALL(*this, recoverResources(_, _, _, _))
+      .WillByDefault(InvokeRecoverResources(this));
+    EXPECT_CALL(*this, recoverResources(_, _, _, _))
+      .WillRepeatedly(DoDefault());
+
+    ON_CALL(*this, reviveOffers(_))
+      .WillByDefault(InvokeReviveOffers(this));
+    EXPECT_CALL(*this, reviveOffers(_))
+      .WillRepeatedly(DoDefault());
   }
 
-  ~MockAllocatorProcess()
-  {
-    process::terminate(real);
-    process::wait(real);
-  }
+  ~TestAllocator() {}
 
-  MOCK_METHOD3(initialize, void(const master::Flags&,
-                                const process::PID<master::Master>&,
-                                const hashmap<std::string, RoleInfo>&));
-  MOCK_METHOD3(frameworkAdded, void(const FrameworkID&,
-                                    const FrameworkInfo&,
-                                    const Resources&));
-  MOCK_METHOD1(frameworkRemoved, void(const FrameworkID&));
-  MOCK_METHOD2(frameworkActivated, void(const FrameworkID&,
-                                        const FrameworkInfo&));
-  MOCK_METHOD1(frameworkDeactivated, void(const FrameworkID&));
-  MOCK_METHOD3(slaveAdded, void(const SlaveID&,
-                                const SlaveInfo&,
-                                const hashmap<FrameworkID, Resources>&));
-  MOCK_METHOD1(slaveRemoved, void(const SlaveID&));
-  MOCK_METHOD1(slaveDeactivated, void(const SlaveID&));
-  MOCK_METHOD1(slaveActivated, void(const SlaveID&));
-  MOCK_METHOD1(updateWhitelist, void(const Option<hashset<std::string> >&));
-  MOCK_METHOD2(resourcesRequested, void(const FrameworkID&,
-                                        const std::vector<Request>&));
-  MOCK_METHOD4(resourcesRecovered, void(const FrameworkID&,
-                                        const SlaveID&,
-                                        const Resources&,
-                                        const Option<Filters>& filters));
-  MOCK_METHOD1(offersRevived, void(const FrameworkID&));
+  MOCK_METHOD3(initialize, void(
+      const master::Flags&,
+      const lambda::function<
+          void(const FrameworkID&,
+               const hashmap<SlaveID, Resources>&)>&,
+      const hashmap<std::string, RoleInfo>&));
+
+  MOCK_METHOD3(addFramework, void(
+      const FrameworkID&,
+      const FrameworkInfo&,
+      const Resources&));
+
+  MOCK_METHOD1(removeFramework, void(
+      const FrameworkID&));
+
+  MOCK_METHOD1(activateFramework, void(
+      const FrameworkID&));
+
+  MOCK_METHOD1(deactivateFramework, void(
+      const FrameworkID&));
+
+  MOCK_METHOD4(addSlave, void(
+      const SlaveID&,
+      const SlaveInfo&,
+      const Resources&,
+      const hashmap<FrameworkID, Resources>&));
+
+  MOCK_METHOD1(removeSlave, void(
+      const SlaveID&));
+
+  MOCK_METHOD1(activateSlave, void(
+      const SlaveID&));
+
+  MOCK_METHOD1(deactivateSlave, void(
+      const SlaveID&));
+
+  MOCK_METHOD1(updateWhitelist, void(
+      const Option<hashset<std::string> >&));
+
+  MOCK_METHOD2(requestResources, void(
+      const FrameworkID&,
+      const std::vector<Request>&));
+
+  MOCK_METHOD3(updateAllocation, void(
+      const FrameworkID&,
+      const SlaveID&,
+      const std::vector<Offer::Operation>&));
+
+  MOCK_METHOD4(recoverResources, void(
+      const FrameworkID&,
+      const SlaveID&,
+      const Resources&,
+      const Option<Filters>& filters));
+
+  MOCK_METHOD1(reviveOffers, void(const FrameworkID&));
 
   T real;
 };
 
 
-typedef ::testing::Types<master::allocator::HierarchicalDRFAllocatorProcess>
-AllocatorTypes;
-
-
 // The following actions make up for the fact that DoDefault
 // cannot be used inside a DoAll, for example:
-// EXPECT_CALL(allocator, frameworkAdded(_, _, _))
-//   .WillOnce(DoAll(InvokeFrameworkAdded(&allocator),
-//                   FutureSatisfy(&frameworkAdded)));
+// EXPECT_CALL(allocator, addFramework(_, _, _))
+//   .WillOnce(DoAll(InvokeAddFramework(&allocator),
+//                   FutureSatisfy(&addFramework)));
 
 ACTION_P(InvokeInitialize, allocator)
 {
-  process::dispatch(
-      allocator->real,
-      &master::allocator::AllocatorProcess::initialize,
-      arg0,
-      arg1,
-      arg2);
+  allocator->real.initialize(arg0, arg1, arg2);
 }
 
 
-ACTION_P(InvokeFrameworkAdded, allocator)
+ACTION_P(InvokeAddFramework, allocator)
 {
-  process::dispatch(
-      allocator->real,
-      &master::allocator::AllocatorProcess::frameworkAdded,
-      arg0,
-      arg1,
-      arg2);
+  allocator->real.addFramework(arg0, arg1, arg2);
 }
 
 
-ACTION_P(InvokeFrameworkRemoved, allocator)
+ACTION_P(InvokeRemoveFramework, allocator)
 {
-  process::dispatch(
-      allocator->real,
-      &master::allocator::AllocatorProcess::frameworkRemoved, arg0);
+  allocator->real.removeFramework(arg0);
 }
 
 
-ACTION_P(InvokeFrameworkActivated, allocator)
+ACTION_P(InvokeActivateFramework, allocator)
 {
-  process::dispatch(
-      allocator->real,
-      &master::allocator::AllocatorProcess::frameworkActivated,
-      arg0,
-      arg1);
+  allocator->real.activateFramework(arg0);
 }
 
 
-ACTION_P(InvokeFrameworkDeactivated, allocator)
+ACTION_P(InvokeDeactivateFramework, allocator)
 {
-  process::dispatch(
-      allocator->real,
-      &master::allocator::AllocatorProcess::frameworkDeactivated,
-      arg0);
+  allocator->real.deactivateFramework(arg0);
 }
 
 
-ACTION_P(InvokeSlaveAdded, allocator)
+ACTION_P(InvokeAddSlave, allocator)
 {
-  process::dispatch(
-      allocator->real,
-      &master::allocator::AllocatorProcess::slaveAdded,
-      arg0,
-      arg1,
-      arg2);
+  allocator->real.addSlave(arg0, arg1, arg2, arg3);
 }
 
 
-ACTION_P(InvokeSlaveRemoved, allocator)
+ACTION_P(InvokeRemoveSlave, allocator)
 {
-  process::dispatch(
-      allocator->real,
-      &master::allocator::AllocatorProcess::slaveRemoved,
-      arg0);
+  allocator->real.removeSlave(arg0);
 }
 
 
-ACTION_P(InvokeSlaveDeactivated, allocator)
+ACTION_P(InvokeActivateSlave, allocator)
 {
-  process::dispatch(
-      allocator->real,
-      &master::allocator::AllocatorProcess::slaveDeactivated,
-      arg0);
+  allocator->real.activateSlave(arg0);
 }
 
 
-ACTION_P(InvokeSlaveReactivated, allocator)
+ACTION_P(InvokeDeactivateSlave, allocator)
 {
-  process::dispatch(
-      allocator->real,
-      &master::allocator::AllocatorProcess::slaveActivated,
-      arg0);
+  allocator->real.deactivateSlave(arg0);
 }
 
 
 ACTION_P(InvokeUpdateWhitelist, allocator)
 {
-  process::dispatch(
-      allocator->real,
-      &master::allocator::AllocatorProcess::updateWhitelist,
-      arg0);
+  allocator->real.updateWhitelist(arg0);
 }
 
 
-ACTION_P(InvokeResourcesRequested, allocator)
+ACTION_P(InvokeRequestResources, allocator)
 {
-  process::dispatch(
-      allocator->real,
-      &master::allocator::AllocatorProcess::resourcesRequested,
-      arg0,
-      arg1);
+  allocator->real.requestResources(arg0, arg1);
 }
 
 
-ACTION_P(InvokeResourcesRecovered, allocator)
+ACTION_P(InvokeUpdateAllocation, allocator)
 {
-  process::dispatch(
-      allocator->real,
-      &master::allocator::AllocatorProcess::resourcesRecovered,
-      arg0,
-      arg1,
-      arg2,
-      arg3);
+  allocator->real.updateAllocation(arg0, arg1, arg2);
 }
 
 
-ACTION_P2(InvokeResourcesRecoveredWithFilters, allocator, timeout)
+ACTION_P(InvokeRecoverResources, allocator)
+{
+  allocator->real.recoverResources(arg0, arg1, arg2, arg3);
+}
+
+
+ACTION_P2(InvokeRecoverResourcesWithFilters, allocator, timeout)
 {
   Filters filters;
   filters.set_refuse_seconds(timeout);
 
-  process::dispatch(
-      allocator->real,
-      &master::allocator::AllocatorProcess::resourcesRecovered,
-      arg0,
-      arg1,
-      arg2,
-      filters);
+  allocator->real.recoverResources(arg0, arg1, arg2, filters);
 }
 
 
-ACTION_P(InvokeOffersRevived, allocator)
+ACTION_P(InvokeReviveOffers, allocator)
 {
-  process::dispatch(
-      allocator->real,
-      &master::allocator::AllocatorProcess::offersRevived,
-      arg0);
+  allocator->real.reviveOffers(arg0);
 }
 
 

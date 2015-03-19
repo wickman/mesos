@@ -37,6 +37,7 @@
 
 m4_define([_AX_CXX_COMPILE_STDCXX_11_testbody], [
   #include <memory>
+  #include <mutex>
 
   template <typename T>
     struct check
@@ -62,6 +63,37 @@ m4_define([_AX_CXX_COMPILE_STDCXX_11_testbody], [
 
   std::unique_ptr<int> i(new int());
   int j = foo(std::move(i));
+
+  std::shared_ptr<int> k = std::make_shared<int>(2);
+
+  void mutexTest()
+  {
+    std::mutex mutex;
+    {
+      // Scope of lockGuard.
+      std::lock_guard<std::mutex> lockGuard(mutex);
+      // End scope of lockGuard.
+    }
+
+    {
+      // Scope of uniqueLock.
+      std::unique_lock<std::mutex> uniqueLock(mutex);
+      // End scope of uniqueLock.
+    }
+  }
+
+  // Check for std::enable_shared_from_this.
+  struct SharedStruct : public std::enable_shared_from_this<SharedStruct>
+  {
+    std::shared_ptr<SharedStruct> get()
+    {
+      return shared_from_this();
+    }
+  };
+
+  // Construct a new shared_ptr using shared_from_this().
+  std::shared_ptr<SharedStruct> object =
+    std::shared_ptr<SharedStruct>(new SharedStruct())->get();
 ])
 
 AC_DEFUN([AX_CXX_COMPILE_STDCXX_11], [

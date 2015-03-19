@@ -43,10 +43,6 @@
 #include "tests/containerizer.hpp"
 #include "tests/mesos.hpp"
 
-using namespace mesos;
-using namespace mesos::internal;
-using namespace mesos::internal::tests;
-
 using mesos::internal::master::Master;
 
 using mesos::internal::slave::Slave;
@@ -64,6 +60,10 @@ using testing::AtMost;
 using testing::DoAll;
 using testing::Return;
 using testing::SaveArg;
+
+namespace mesos {
+namespace internal {
+namespace tests {
 
 class ReconciliationTest : public MesosTest {};
 
@@ -272,8 +272,6 @@ TEST_F(ReconciliationTest, UnknownSlave)
 
   driver.stop();
   driver.join();
-
-  Shutdown();
 }
 
 
@@ -332,8 +330,48 @@ TEST_F(ReconciliationTest, UnknownTask)
 
   driver.stop();
   driver.join();
+}
 
-  Shutdown(); // Must shutdown before 'containerizer' gets deallocated.
+
+// This test verifies that the killTask request of an unknown task
+// results in reconciliation. In this case, the task is unknown
+// and there are no transitional slaves.
+TEST_F(ReconciliationTest, UnknownKillTask)
+{
+  Try<PID<Master> > master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+    &sched, DEFAULT_FRAMEWORK_INFO, master.get(), DEFAULT_CREDENTIAL);
+
+  Future<FrameworkID> frameworkId;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureArg<1>(&frameworkId));
+
+  driver.start();
+
+  // Wait until the framework is registered.
+  AWAIT_READY(frameworkId);
+
+  Future<TaskStatus> update;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&update));
+
+  vector<TaskStatus> statuses;
+
+  // Create a task status with a random task id.
+  TaskID taskId;
+  taskId.set_value(UUID::random().toString());
+
+  driver.killTask(taskId);
+
+  // Framework should receive TASK_LOST for unknown task.
+  AWAIT_READY(update);
+  EXPECT_EQ(TASK_LOST, update.get().state());
+
+  driver.stop();
+  driver.join();
 }
 
 
@@ -426,8 +464,6 @@ TEST_F(ReconciliationTest, SlaveInTransition)
 
   driver.stop();
   driver.join();
-
-  Shutdown();
 }
 
 
@@ -661,8 +697,6 @@ TEST_F(ReconciliationTest, PendingTask)
 
   driver.stop();
   driver.join();
-
-  Shutdown(); // Must shutdown before 'containerizer' gets deallocated.
 }
 
 
@@ -706,7 +740,7 @@ TEST_F(ReconciliationTest, UnacknowledgedTerminalTask)
   // Prevent the slave from retrying the status update by
   // only allowing a single update through to the master.
   DROP_PROTOBUFS(StatusUpdateMessage(), _, master.get());
-  FUTURE_PROTOBUF(StatusUpdateMessage(), _, master.get());;
+  FUTURE_PROTOBUF(StatusUpdateMessage(), _, master.get());
 
   // Drop the status update acknowledgements to ensure that the
   // task remains terminal and unacknowledged in the master.
@@ -853,5 +887,9 @@ TEST_F(ReconciliationTest, ReconcileStatusUpdateTaskState)
   driver.stop();
   driver.join();
 
-  Shutdown();
+  Shutdown(); // Must shutdown before the detector gets de-allocated.
 }
+
+} // namespace tests {
+} // namespace internal {
+} // namespace mesos {

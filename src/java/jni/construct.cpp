@@ -50,6 +50,12 @@ T parse(const void* data, int size)
 }
 
 
+bool construct(JNIEnv* env, jboolean jbool)
+{
+  return jbool == JNI_TRUE;
+}
+
+
 template <>
 string construct(JNIEnv* env, jobject jobj)
 {
@@ -373,4 +379,25 @@ Request construct(JNIEnv* env, jobject jobj)
   env->ReleaseByteArrayElements(jdata, data, 0);
 
   return request;
+}
+
+
+template <>
+Offer::Operation construct(JNIEnv* env, jobject jobj)
+{
+  jclass clazz = env->GetObjectClass(jobj);
+
+  // byte[] data = obj.toByteArray();
+  jmethodID toByteArray = env->GetMethodID(clazz, "toByteArray", "()[B");
+
+  jbyteArray jdata = (jbyteArray) env->CallObjectMethod(jobj, toByteArray);
+
+  jbyte* data = env->GetByteArrayElements(jdata, NULL);
+  jsize length = env->GetArrayLength(jdata);
+
+  const Offer::Operation& operation = parse<Offer::Operation>(data, length);
+
+  env->ReleaseByteArrayElements(jdata, data, 0);
+
+  return operation;
 }

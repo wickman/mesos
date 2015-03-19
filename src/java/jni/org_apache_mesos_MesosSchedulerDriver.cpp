@@ -283,8 +283,8 @@ void JNIScheduler::statusUpdate(SchedulerDriver* driver,
   // scheduler.statusUpdate(driver, status);
   jmethodID statusUpdate =
     env->GetMethodID(clazz, "statusUpdate",
-		     "(Lorg/apache/mesos/SchedulerDriver;"
-		     "Lorg/apache/mesos/Protos$TaskStatus;)V");
+                     "(Lorg/apache/mesos/SchedulerDriver;"
+                     "Lorg/apache/mesos/Protos$TaskStatus;)V");
 
   jobject jstatus = convert<TaskStatus>(env, status);
 
@@ -498,13 +498,31 @@ JNIEXPORT void JNICALL Java_org_apache_mesos_MesosSchedulerDriver_initialize
   jfieldID master = env->GetFieldID(clazz, "master", "Ljava/lang/String;");
   jobject jmaster = env->GetObjectField(thiz, master);
 
+  // NOTE: Older versions (< 0.22.0) of MesosSchedulerDriver.java
+  // do not have the 'implicitAcknowledgements' field, so when None()
+  // is returned we default to the old behavior: implicit
+  // acknowledgements.
+  Result<jfieldID> implicitAcknowledgements =
+    getFieldID(env, clazz, "implicitAcknowledgements", "Z");
+
+  if (implicitAcknowledgements.isError()) {
+    return; // Exception has been thrown.
+  }
+
+  // Default to implicit acknowledgements, as done before 0.22.0.
+  jboolean jimplicitAcknowledgements = JNI_TRUE;
+  if (implicitAcknowledgements.isSome()) {
+    jimplicitAcknowledgements =
+      env->GetBooleanField(thiz, implicitAcknowledgements.get());
+  }
+
   // Get out the Credential passed into the constructor.
   // NOTE: Older versions (< 0.15.0) of MesosSchedulerDriver do not set
   // 'credential' field. To be backwards compatible we should safely
   // handle this case.
   Result<jfieldID> credential = getFieldID(env, clazz, "credential", "Lorg/apache/mesos/Protos$Credential;");
   if (credential.isError()) {
-    return;
+    return; // Exception has been thrown.
   }
 
   jobject jcredential = NULL;
@@ -520,12 +538,14 @@ JNIEXPORT void JNICALL Java_org_apache_mesos_MesosSchedulerDriver_initialize
         scheduler,
         construct<FrameworkInfo>(env, jframework),
         construct<string>(env, jmaster),
+        construct(env, jimplicitAcknowledgements),
         construct<Credential>(env, jcredential));
   } else {
     driver = new MesosSchedulerDriver(
        scheduler,
        construct<FrameworkInfo>(env, jframework),
-       construct<string>(env, jmaster));
+       construct<string>(env, jmaster),
+       construct(env, jimplicitAcknowledgements));
   }
 
   // Initialize the __driver variable
@@ -641,6 +661,30 @@ JNIEXPORT jobject JNICALL Java_org_apache_mesos_MesosSchedulerDriver_join
     (MesosSchedulerDriver*) env->GetLongField(thiz, __driver);
 
   Status status = driver->join();
+
+  return convert<Status>(env, status);
+}
+
+
+/*
+ * Class:     org_apache_mesos_MesosSchedulerDriver
+ * Method:    acknowledgeStatusUpdate
+ * Signature: (Lorg/apache/mesos/Protos/TaskStatus;)Lorg/apache/mesos/Protos/Status;
+ */
+JNIEXPORT jobject JNICALL Java_org_apache_mesos_MesosSchedulerDriver_acknowledgeStatusUpdate
+  (JNIEnv* env, jobject thiz, jobject jtaskStatus)
+{
+  // Construct a C++ TaskID from the Java TaskId.
+  const TaskStatus& taskStatus = construct<TaskStatus>(env, jtaskStatus);
+
+  // Now invoke the underlying driver.
+  jclass clazz = env->GetObjectClass(thiz);
+
+  jfieldID __driver = env->GetFieldID(clazz, "__driver", "J");
+  MesosSchedulerDriver* driver =
+    (MesosSchedulerDriver*) env->GetLongField(thiz, __driver);
+
+  Status status = driver->acknowledgeStatusUpdate(taskStatus);
 
   return convert<Status>(env, status);
 }
@@ -823,6 +867,73 @@ JNIEXPORT jobject JNICALL Java_org_apache_mesos_MesosSchedulerDriver_launchTasks
     (MesosSchedulerDriver*) env->GetLongField(thiz, __driver);
 
   Status status = driver->launchTasks(offers, tasks, filters);
+
+  return convert<Status>(env, status);
+}
+
+
+/*
+ * Class:     org_apache_mesos_MesosSchedulerDriver
+ * Method:    acceptOffers
+ * Signature: (Ljava/util/Collection;Ljava/util/Collection;Lorg/apache/mesos/Protos$Filters;)Lorg/apache/mesos/Protos/Status;
+ */
+JNIEXPORT jobject JNICALL Java_org_apache_mesos_MesosSchedulerDriver_acceptOffers__Ljava_util_Collection_2Ljava_util_Collection_2Lorg_apache_mesos_Protos_00024Filters_2
+  (JNIEnv* env, jobject thiz, jobject jofferIds, jobject joperations, jobject jfilters)
+{
+  // Construct C++ OfferIDs from each Java OfferIDs.
+  vector<OfferID> offers;
+  jclass clazz = env->GetObjectClass(jofferIds);
+
+  // Iterator iterator = offerIds.iterator();
+  jmethodID iterator =
+    env->GetMethodID(clazz, "iterator", "()Ljava/util/Iterator;");
+  jobject jiterator = env->CallObjectMethod(jofferIds, iterator);
+
+  clazz = env->GetObjectClass(jiterator);
+
+  // while (iterator.hasNext()) {
+  jmethodID hasNext = env->GetMethodID(clazz, "hasNext", "()Z");
+
+  jmethodID next = env->GetMethodID(clazz, "next", "()Ljava/lang/Object;");
+
+  while (env->CallBooleanMethod(jiterator, hasNext)) {
+    // Object offerId = iterator.next();
+    jobject jofferId = env->CallObjectMethod(jiterator, next);
+    offers.push_back(construct<OfferID>(env, jofferId));
+  }
+
+  // Construct C++ Offer::Operations from each Java Offer.Operations.
+  vector<Offer::Operation> operations;
+  clazz = env->GetObjectClass(joperations);
+
+  // Iterator iterator = operations.iterator();
+  iterator = env->GetMethodID(clazz, "iterator", "()Ljava/util/Iterator;");
+  jiterator = env->CallObjectMethod(joperations, iterator);
+
+  clazz = env->GetObjectClass(jiterator);
+
+  // while (iterator.hasNext()) {
+  hasNext = env->GetMethodID(clazz, "hasNext", "()Z");
+
+  next = env->GetMethodID(clazz, "next", "()Ljava/lang/Object;");
+
+  while (env->CallBooleanMethod(jiterator, hasNext)) {
+    // Object operation = iterator.next();
+    jobject joperation = env->CallObjectMethod(jiterator, next);
+    operations.push_back(construct<Offer::Operation>(env, joperation));
+  }
+
+  // Construct C++ Filters from the Java Filters.
+  const Filters& filters = construct<Filters>(env, jfilters);
+
+  // Now invoke the underlying driver.
+  clazz = env->GetObjectClass(thiz);
+
+  jfieldID __driver = env->GetFieldID(clazz, "__driver", "J");
+  MesosSchedulerDriver* driver =
+    (MesosSchedulerDriver*) env->GetLongField(thiz, __driver);
+
+  Status status = driver->acceptOffers(offers, operations, filters);
 
   return convert<Status>(env, status);
 }

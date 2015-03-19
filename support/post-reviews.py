@@ -192,7 +192,7 @@ for i in range(len(shas)):
         command = command + ['--review-request-id=' + review_request_id]
 
     # Determine how to specify the revision range.
-    if 'rbt' in post_review and rbt_version.startswith('RBTools 0.6'):
+    if 'rbt' in post_review and not rbt_version.startswith('RBTools 0.5'):
         # rbt >= 0.6 revisions are passed in as args.
         command = command + sys.argv[1:] + [previous, sha]
     else:
@@ -217,6 +217,12 @@ for i in range(len(shas)):
     # The second to the last line of output in rbt is the review url.
     url = lines[len(lines) - 2] if 'rbt' in post_review \
         else lines[len(lines) - 1]
+
+    # Using rbt >= 0.6.3 on Linux prints out two URLs where the second
+    # one has /diff/ at the end. We want to remove this so that a
+    # subsequent call to post-reviews does not fail when looking up
+    # the reviewboard entry to edit.
+    url = url.replace('diff/','')
     url = url.strip('/')
 
     # Construct new commit message.

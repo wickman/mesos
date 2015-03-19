@@ -56,10 +56,6 @@
 #include "tests/mesos.hpp"
 #include "tests/utils.hpp"
 
-using namespace mesos;
-using namespace mesos::internal;
-using namespace mesos::internal::tests;
-
 using mesos::internal::master::Master;
 
 using mesos::internal::slave::GarbageCollector;
@@ -79,6 +75,10 @@ using testing::_;
 using testing::AtMost;
 using testing::Return;
 using testing::SaveArg;
+
+namespace mesos {
+namespace internal {
+namespace tests {
 
 class GarbageCollectorTest : public TemporaryDirectoryTest {};
 
@@ -276,8 +276,8 @@ TEST_F(GarbageCollectorIntegrationTest, Restart)
     .Times(1);
 
   Resources resources = Resources::parse(flags.resources.get()).get();
-  double cpus = resources.get("cpus", Value::Scalar()).value();
-  double mem = resources.get("mem", Value::Scalar()).value();
+  double cpus = resources.get<Value::Scalar>("cpus").get().value();
+  double mem = resources.get<Value::Scalar>("mem").get().value();
 
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(LaunchTasks(DEFAULT_EXECUTOR_INFO, 1, cpus, mem, "*"))
@@ -383,8 +383,8 @@ TEST_F(GarbageCollectorIntegrationTest, ExitedFramework)
     .WillOnce(SaveArg<1>(&frameworkId));
 
   Resources resources = Resources::parse(flags.resources.get()).get();
-  double cpus = resources.get("cpus", Value::Scalar()).value();
-  double mem = resources.get("mem", Value::Scalar()).value();
+  double cpus = resources.get<Value::Scalar>("cpus").get().value();
+  double mem = resources.get<Value::Scalar>("mem").get().value();
 
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(LaunchTasks(DEFAULT_EXECUTOR_INFO, 1, cpus, mem, "*"))
@@ -458,7 +458,7 @@ TEST_F(GarbageCollectorIntegrationTest, ExitedFramework)
 
   ASSERT_FALSE(os::exists(frameworkDir));
 
-  process::UPID filesUpid("files", process::ip(), process::port());
+  process::UPID filesUpid("files", process::address());
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(
       process::http::NotFound().status,
       process::http::get(filesUpid, "browse.json", "path=" + frameworkDir));
@@ -498,8 +498,8 @@ TEST_F(GarbageCollectorIntegrationTest, ExitedExecutor)
     .WillOnce(FutureArg<1>(&frameworkId));
 
   Resources resources = Resources::parse(flags.resources.get()).get();
-  double cpus = resources.get("cpus", Value::Scalar()).value();
-  double mem = resources.get("mem", Value::Scalar()).value();
+  double cpus = resources.get<Value::Scalar>("cpus").get().value();
+  double mem = resources.get<Value::Scalar>("mem").get().value();
 
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(LaunchTasks(DEFAULT_EXECUTOR_INFO, 1, cpus, mem, "*"))
@@ -559,7 +559,7 @@ TEST_F(GarbageCollectorIntegrationTest, ExitedExecutor)
   // Executor's directory should be gc'ed by now.
   ASSERT_FALSE(os::exists(executorDir));
 
-  process::UPID files("files", process::ip(), process::port());
+  process::UPID files("files", process::address());
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(
       process::http::NotFound().status,
       process::http::get(files, "browse.json", "path=" + executorDir));
@@ -602,8 +602,8 @@ TEST_F(GarbageCollectorIntegrationTest, DiskUsage)
     .WillOnce(FutureArg<1>(&frameworkId));
 
   Resources resources = Resources::parse(flags.resources.get()).get();
-  double cpus = resources.get("cpus", Value::Scalar()).value();
-  double mem = resources.get("mem", Value::Scalar()).value();
+  double cpus = resources.get<Value::Scalar>("cpus").get().value();
+  double mem = resources.get<Value::Scalar>("mem").get().value();
 
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(LaunchTasks(DEFAULT_EXECUTOR_INFO, 1, cpus, mem, "*"))
@@ -674,7 +674,7 @@ TEST_F(GarbageCollectorIntegrationTest, DiskUsage)
   // Executor's directory should be gc'ed by now.
   ASSERT_FALSE(os::exists(executorDir));
 
-  process::UPID files("files", process::ip(), process::port());
+  process::UPID files("files", process::address());
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(
       process::http::NotFound().status,
       process::http::get(files, "browse.json", "path=" + executorDir));
@@ -730,8 +730,8 @@ TEST_F(GarbageCollectorIntegrationTest, Unschedule)
     .WillOnce(FutureArg<1>(&frameworkId));
 
   Resources resources = Resources::parse(flags.resources.get()).get();
-  double cpus = resources.get("cpus", Value::Scalar()).value();
-  double mem = resources.get("mem", Value::Scalar()).value();
+  double cpus = resources.get<Value::Scalar>("cpus").get().value();
+  double mem = resources.get<Value::Scalar>("mem").get().value();
 
   EXPECT_CALL(sched, resourceOffers(_, _))
     .WillOnce(LaunchTasks(executor1, 1, cpus, mem, "*"));
@@ -818,3 +818,7 @@ TEST_F(GarbageCollectorIntegrationTest, Unschedule)
 
   Shutdown(); // Must shutdown before 'isolator' gets deallocated.
 }
+
+} // namespace tests {
+} // namespace internal {
+} // namespace mesos {

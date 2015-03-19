@@ -20,6 +20,7 @@
 
 #include <gmock/gmock.h>
 
+#include <algorithm>
 #include <map>
 #include <string>
 #include <vector>
@@ -35,6 +36,7 @@
 #include <process/pid.hpp>
 #include <process/subprocess.hpp>
 
+#include <stout/memory.hpp>
 #include <stout/option.hpp>
 #include <stout/os.hpp>
 #include <stout/try.hpp>
@@ -49,29 +51,22 @@
 #include "slave/flags.hpp"
 #include "slave/slave.hpp"
 
+#include "slave/containerizer/fetcher.hpp"
+
 #include "slave/containerizer/mesos/containerizer.hpp"
 
 #include "tests/containerizer.hpp"
 #include "tests/flags.hpp"
+#include "tests/limiter.hpp"
 #include "tests/mesos.hpp"
 
-using namespace mesos;
-using namespace mesos::internal;
-using namespace mesos::internal::tests;
+using memory::shared_ptr;
+
+using namespace mesos::internal::slave;
+
+using namespace process;
 
 using mesos::internal::master::Master;
-
-using mesos::internal::slave::GarbageCollectorProcess;
-using mesos::internal::slave::Slave;
-using mesos::internal::slave::Containerizer;
-using mesos::internal::slave::MesosContainerizer;
-using mesos::internal::slave::MesosContainerizerProcess;
-
-using process::Clock;
-using process::Future;
-using process::Message;
-using process::Owned;
-using process::PID;
 
 using std::map;
 using std::string;
@@ -85,6 +80,11 @@ using testing::Invoke;
 using testing::InvokeWithoutArgs;
 using testing::Return;
 using testing::SaveArg;
+using testing::Sequence;
+
+namespace mesos {
+namespace internal {
+namespace tests {
 
 // Those of the overall Mesos master/slave/scheduler/driver tests
 // that seem vaguely more slave than master-related are in this file.
@@ -103,8 +103,10 @@ TEST_F(SlaveTest, ShutdownUnregisteredExecutor)
   // Set the isolation flag so we know a MesoContainerizer will be created.
   flags.isolation = "posix/cpu,posix/mem";
 
+  Fetcher fetcher;
+
   Try<MesosContainerizer*> containerizer =
-    MesosContainerizer::create(flags, false);
+    MesosContainerizer::create(flags, false, &fetcher);
   CHECK_SOME(containerizer);
 
   Try<PID<Slave> > slave = StartSlave(containerizer.get());
@@ -143,7 +145,7 @@ TEST_F(SlaveTest, ShutdownUnregisteredExecutor)
   tasks.push_back(task);
 
   // Drop the registration message from the executor to the slave.
-  Future<process::Message> registerExecutor =
+  Future<Message> registerExecutor =
     DROP_MESSAGE(Eq(RegisterExecutorMessage().GetTypeName()), _, _);
 
   driver.launchTasks(offers.get()[0].id(), tasks);
@@ -174,6 +176,7 @@ TEST_F(SlaveTest, ShutdownUnregisteredExecutor)
 
   AWAIT_READY(status);
   ASSERT_EQ(TASK_FAILED, status.get().state());
+  EXPECT_EQ(TaskStatus::SOURCE_SLAVE, status.get().source());
 
   Clock::resume();
 
@@ -226,7 +229,7 @@ TEST_F(SlaveTest, RemoveUnregisteredTerminatedExecutor)
   tasks.push_back(task);
 
   // Drop the registration message from the executor to the slave.
-  Future<process::Message> registerExecutorMessage =
+  Future<Message> registerExecutorMessage =
     DROP_MESSAGE(Eq(RegisterExecutorMessage().GetTypeName()), _, _);
 
   driver.launchTasks(offers.get()[0].id(), tasks);
@@ -245,6 +248,8 @@ TEST_F(SlaveTest, RemoveUnregisteredTerminatedExecutor)
 
   AWAIT_READY(status);
   EXPECT_EQ(TASK_LOST, status.get().state());
+  EXPECT_EQ(TaskStatus::SOURCE_SLAVE, status.get().source());
+  EXPECT_EQ(TaskStatus::REASON_EXECUTOR_TERMINATED, status.get().reason());
 
   // We use 'gc.schedule' as a signal for the executor being cleaned
   // up by the slave.
@@ -260,9 +265,9 @@ TEST_F(SlaveTest, RemoveUnregisteredTerminatedExecutor)
 }
 
 
-// Test that we can run the mesos-executor and specify an "override"
+// Test that we can run the command executor and specify an "override"
 // command to use via the --override argument.
-TEST_F(SlaveTest, MesosExecutorWithOverride)
+TEST_F(SlaveTest, CommandExecutorWithOverride)
 {
   Try<PID<Master> > master = StartMaster();
   ASSERT_SOME(master);
@@ -314,7 +319,7 @@ TEST_F(SlaveTest, MesosExecutorWithOverride)
   // Expect wait after launch is called but don't return anything
   // until after we've finished everything below.
   Future<Nothing> wait;
-  process::Promise<containerizer::Termination> promise;
+  Promise<containerizer::Termination> promise;
   EXPECT_CALL(containerizer, wait(_))
     .WillOnce(DoAll(FutureSatisfy(&wait),
                     Return(promise.future())));
@@ -346,27 +351,30 @@ TEST_F(SlaveTest, MesosExecutorWithOverride)
   // Expect two status updates, one for once the mesos-executor says
   // the task is running and one for after our overridden command
   // above finishes.
-  Future<TaskStatus> status1, status2;
+  Future<TaskStatus> statusRunning, statusFinished;
   EXPECT_CALL(sched, statusUpdate(_, _))
-    .WillOnce(FutureArg<1>(&status1))
-    .WillOnce(FutureArg<1>(&status2));
+    .WillOnce(FutureArg<1>(&statusRunning))
+    .WillOnce(FutureArg<1>(&statusFinished));
 
-  Try<process::Subprocess> executor =
-    process::subprocess(
+  Try<Subprocess> executor =
+    subprocess(
         executorCommand,
-        process::Subprocess::PIPE(),
-        process::Subprocess::PIPE(),
-        process::Subprocess::PIPE(),
+        Subprocess::PIPE(),
+        Subprocess::PIPE(),
+        Subprocess::PIPE(),
         environment);
 
   ASSERT_SOME(executor);
 
-  // Scheduler should receive the TASK_RUNNING update.
-  AWAIT_READY(status1);
-  ASSERT_EQ(TASK_RUNNING, status1.get().state());
+  // Scheduler should first receive TASK_RUNNING followed by the
+  // TASK_FINISHED from the executor.
+  AWAIT_READY(statusRunning);
+  ASSERT_EQ(TASK_RUNNING, statusRunning.get().state());
+  EXPECT_EQ(TaskStatus::SOURCE_EXECUTOR, statusRunning.get().source());
 
-  AWAIT_READY(status2);
-  ASSERT_EQ(TASK_FINISHED, status2.get().state());
+  AWAIT_READY(statusFinished);
+  ASSERT_EQ(TASK_FINISHED, statusFinished.get().state());
+  EXPECT_EQ(TaskStatus::SOURCE_EXECUTOR, statusFinished.get().source());
 
   AWAIT_READY(wait);
 
@@ -397,7 +405,7 @@ TEST_F(SlaveTest, MesosExecutorWithOverride)
 // mesos-executor args. For more details of this see MESOS-1873.
 //
 // This assumes the ability to execute '/bin/echo --author'.
-TEST_F(SlaveTest, MesosExecutorCommandTaskWithArgsList)
+TEST_F(SlaveTest, ComamndTaskWithArguments)
 {
   Try<PID<Master> > master = StartMaster();
   ASSERT_SOME(master);
@@ -406,8 +414,10 @@ TEST_F(SlaveTest, MesosExecutorCommandTaskWithArgsList)
   slave::Flags flags = CreateSlaveFlags();
   flags.isolation = "posix/cpu,posix/mem";
 
+  Fetcher fetcher;
+
   Try<MesosContainerizer*> containerizer =
-    MesosContainerizer::create(flags, false);
+    MesosContainerizer::create(flags, false, &fetcher);
   CHECK_SOME(containerizer);
 
   Try<PID<Slave> > slave = StartSlave(containerizer.get());
@@ -457,11 +467,15 @@ TEST_F(SlaveTest, MesosExecutorCommandTaskWithArgsList)
 
   driver.launchTasks(offers.get()[0].id(), tasks);
 
+  // Scheduler should first receive TASK_RUNNING followed by the
+  // TASK_FINISHED from the executor.
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning.get().state());
+  EXPECT_EQ(TaskStatus::SOURCE_EXECUTOR, statusRunning.get().source());
 
   AWAIT_READY(statusFinished);
   EXPECT_EQ(TASK_FINISHED, statusFinished.get().state());
+  EXPECT_EQ(TaskStatus::SOURCE_EXECUTOR, statusFinished.get().source());
 
   driver.stop();
   driver.join();
@@ -528,8 +542,10 @@ TEST_F(SlaveTest, ROOT_RunTaskWithCommandInfoWithoutUser)
   slave::Flags flags = CreateSlaveFlags();
   flags.isolation = "posix/cpu,posix/mem";
 
+  Fetcher fetcher;
+
   Try<MesosContainerizer*> containerizer =
-    MesosContainerizer::create(flags, false);
+    MesosContainerizer::create(flags, false, &fetcher);
   CHECK_SOME(containerizer);
 
   Try<PID<Slave> > slave = StartSlave(containerizer.get());
@@ -563,9 +579,15 @@ TEST_F(SlaveTest, ROOT_RunTaskWithCommandInfoWithoutUser)
   CHECK_SOME(user) << "Failed to get current user name"
                    << (user.isError() ? ": " + user.error() : "");
 
+  const string helper =
+      path::join(tests::flags.build_dir, "src", "active-user-test-helper");
+
   // Command executor will run as user running test.
   CommandInfo command;
-  command.set_value("test `whoami` = " + user.get());
+  command.set_shell(false);
+  command.set_value(helper);
+  command.add_arguments(helper);
+  command.add_arguments(user.get());
 
   task.mutable_command()->MergeFrom(command);
 
@@ -580,11 +602,15 @@ TEST_F(SlaveTest, ROOT_RunTaskWithCommandInfoWithoutUser)
 
   driver.launchTasks(offers.get()[0].id(), tasks);
 
+  // Scheduler should first receive TASK_RUNNING followed by the
+  // TASK_FINISHED from the executor.
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning.get().state());
+  EXPECT_EQ(TaskStatus::SOURCE_EXECUTOR, statusRunning.get().source());
 
   AWAIT_READY(statusFinished);
   EXPECT_EQ(TASK_FINISHED, statusFinished.get().state());
+  EXPECT_EQ(TaskStatus::SOURCE_EXECUTOR, statusFinished.get().source());
 
   driver.stop();
   driver.join();
@@ -616,8 +642,10 @@ TEST_F(SlaveTest, DISABLED_ROOT_RunTaskWithCommandInfoWithUser)
   slave::Flags flags = CreateSlaveFlags();
   flags.isolation = "posix/cpu,posix/mem";
 
+  Fetcher fetcher;
+
   Try<MesosContainerizer*> containerizer =
-    MesosContainerizer::create(flags, false);
+    MesosContainerizer::create(flags, false, &fetcher);
   CHECK_SOME(containerizer);
 
   Try<PID<Slave> > slave = StartSlave(containerizer.get());
@@ -647,9 +675,15 @@ TEST_F(SlaveTest, DISABLED_ROOT_RunTaskWithCommandInfoWithUser)
   task.mutable_slave_id()->MergeFrom(offers.get()[0].slave_id());
   task.mutable_resources()->MergeFrom(offers.get()[0].resources());
 
+  const string helper =
+      path::join(tests::flags.build_dir, "src", "active-user-test-helper");
+
   CommandInfo command;
-  command.set_value("test `whoami` = " + testUser);
   command.set_user(testUser);
+  command.set_shell(false);
+  command.set_value(helper);
+  command.add_arguments(helper);
+  command.add_arguments(testUser);
 
   task.mutable_command()->MergeFrom(command);
 
@@ -664,11 +698,15 @@ TEST_F(SlaveTest, DISABLED_ROOT_RunTaskWithCommandInfoWithUser)
 
   driver.launchTasks(offers.get()[0].id(), tasks);
 
+  // Scheduler should first receive TASK_RUNNING followed by the
+  // TASK_FINISHED from the executor.
   AWAIT_READY(statusRunning);
   EXPECT_EQ(TASK_RUNNING, statusRunning.get().state());
+  EXPECT_EQ(TaskStatus::SOURCE_EXECUTOR, statusRunning.get().source());
 
   AWAIT_READY(statusFinished);
   EXPECT_EQ(TASK_FINISHED, statusFinished.get().state());
+  EXPECT_EQ(TaskStatus::SOURCE_EXECUTOR, statusFinished.get().source());
 
   driver.stop();
   driver.join();
@@ -702,13 +740,13 @@ TEST_F(SlaveTest, IgnoreNonLeaderStatusUpdateAcknowledgement)
     .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   // We need to grab this message to get the scheduler's pid.
-  Future<process::Message> frameworkRegisteredMessage = FUTURE_MESSAGE(
+  Future<Message> frameworkRegisteredMessage = FUTURE_MESSAGE(
       Eq(FrameworkRegisteredMessage().GetTypeName()), master.get(), _);
 
   schedDriver.start();
 
   AWAIT_READY(frameworkRegisteredMessage);
-  const process::UPID schedulerPid = frameworkRegisteredMessage.get().to;
+  const UPID schedulerPid = frameworkRegisteredMessage.get().to;
 
   AWAIT_READY(offers);
   EXPECT_NE(0u, offers.get().size());
@@ -750,10 +788,9 @@ TEST_F(SlaveTest, IgnoreNonLeaderStatusUpdateAcknowledgement)
   AWAIT_READY(acknowledgementMessage);
 
   // Send the acknowledgement to the slave with a non-leading master.
-  process::post(
-      process::UPID("master@localhost:1"),
-      slave.get(),
-      acknowledgementMessage.get());
+  post(process::UPID("master@localhost:1"),
+       slave.get(),
+       acknowledgementMessage.get());
 
   // Make sure the acknowledgement was ignored.
   Clock::settle();
@@ -787,66 +824,57 @@ TEST_F(SlaveTest, IgnoreNonLeaderStatusUpdateAcknowledgement)
 }
 
 
-TEST_F(SlaveTest, MetricsInStatsEndpoint)
+TEST_F(SlaveTest, MetricsInMetricsEndpoint)
 {
-  Try<PID<Master> > master = StartMaster();
+  Try<PID<Master>> master = StartMaster();
   ASSERT_SOME(master);
 
-  Try<PID<Slave> > slave = StartSlave();
+  Try<PID<Slave>> slave = StartSlave();
   ASSERT_SOME(slave);
 
-  Future<process::http::Response> response =
-    process::http::get(slave.get(), "stats.json");
+  JSON::Object snapshot = Metrics();
 
-  AWAIT_READY(response);
+  EXPECT_EQ(1u, snapshot.values.count("slave/uptime_secs"));
+  EXPECT_EQ(1u, snapshot.values.count("slave/registered"));
 
-  EXPECT_SOME_EQ(
-      "application/json",
-      response.get().headers.get("Content-Type"));
+  EXPECT_EQ(1u, snapshot.values.count("slave/recovery_errors"));
 
-  Try<JSON::Object> parse = JSON::parse<JSON::Object>(response.get().body);
+  EXPECT_EQ(1u, snapshot.values.count("slave/frameworks_active"));
 
-  ASSERT_SOME(parse);
+  EXPECT_EQ(1u, snapshot.values.count("slave/tasks_staging"));
+  EXPECT_EQ(1u, snapshot.values.count("slave/tasks_starting"));
+  EXPECT_EQ(1u, snapshot.values.count("slave/tasks_running"));
+  EXPECT_EQ(1u, snapshot.values.count("slave/tasks_finished"));
+  EXPECT_EQ(1u, snapshot.values.count("slave/tasks_failed"));
+  EXPECT_EQ(1u, snapshot.values.count("slave/tasks_killed"));
+  EXPECT_EQ(1u, snapshot.values.count("slave/tasks_lost"));
 
-  JSON::Object stats = parse.get();
+  EXPECT_EQ(1u, snapshot.values.count("slave/executors_registering"));
+  EXPECT_EQ(1u, snapshot.values.count("slave/executors_running"));
+  EXPECT_EQ(1u, snapshot.values.count("slave/executors_terminating"));
+  EXPECT_EQ(1u, snapshot.values.count("slave/executors_terminated"));
 
-  EXPECT_EQ(1u, stats.values.count("slave/uptime_secs"));
-  EXPECT_EQ(1u, stats.values.count("slave/registered"));
+  EXPECT_EQ(1u, snapshot.values.count("slave/valid_status_updates"));
+  EXPECT_EQ(1u, snapshot.values.count("slave/invalid_status_updates"));
 
-  EXPECT_EQ(1u, stats.values.count("slave/recovery_errors"));
+  EXPECT_EQ(1u, snapshot.values.count("slave/valid_framework_messages"));
+  EXPECT_EQ(1u, snapshot.values.count("slave/invalid_framework_messages"));
 
-  EXPECT_EQ(1u, stats.values.count("slave/frameworks_active"));
+  EXPECT_EQ(
+      1u,
+      snapshot.values.count("slave/executor_directory_max_allowed_age_secs"));
 
-  EXPECT_EQ(1u, stats.values.count("slave/tasks_staging"));
-  EXPECT_EQ(1u, stats.values.count("slave/tasks_starting"));
-  EXPECT_EQ(1u, stats.values.count("slave/tasks_running"));
-  EXPECT_EQ(1u, stats.values.count("slave/tasks_finished"));
-  EXPECT_EQ(1u, stats.values.count("slave/tasks_failed"));
-  EXPECT_EQ(1u, stats.values.count("slave/tasks_killed"));
-  EXPECT_EQ(1u, stats.values.count("slave/tasks_lost"));
+  EXPECT_EQ(1u, snapshot.values.count("slave/cpus_total"));
+  EXPECT_EQ(1u, snapshot.values.count("slave/cpus_used"));
+  EXPECT_EQ(1u, snapshot.values.count("slave/cpus_percent"));
 
-  EXPECT_EQ(1u, stats.values.count("slave/executors_registering"));
-  EXPECT_EQ(1u, stats.values.count("slave/executors_running"));
-  EXPECT_EQ(1u, stats.values.count("slave/executors_terminating"));
-  EXPECT_EQ(1u, stats.values.count("slave/executors_terminated"));
+  EXPECT_EQ(1u, snapshot.values.count("slave/mem_total"));
+  EXPECT_EQ(1u, snapshot.values.count("slave/mem_used"));
+  EXPECT_EQ(1u, snapshot.values.count("slave/mem_percent"));
 
-  EXPECT_EQ(1u, stats.values.count("slave/valid_status_updates"));
-  EXPECT_EQ(1u, stats.values.count("slave/invalid_status_updates"));
-
-  EXPECT_EQ(1u, stats.values.count("slave/valid_framework_messages"));
-  EXPECT_EQ(1u, stats.values.count("slave/invalid_framework_messages"));
-
-  EXPECT_EQ(1u, stats.values.count("slave/cpus_total"));
-  EXPECT_EQ(1u, stats.values.count("slave/cpus_used"));
-  EXPECT_EQ(1u, stats.values.count("slave/cpus_percent"));
-
-  EXPECT_EQ(1u, stats.values.count("slave/mem_total"));
-  EXPECT_EQ(1u, stats.values.count("slave/mem_used"));
-  EXPECT_EQ(1u, stats.values.count("slave/mem_percent"));
-
-  EXPECT_EQ(1u, stats.values.count("slave/disk_total"));
-  EXPECT_EQ(1u, stats.values.count("slave/disk_used"));
-  EXPECT_EQ(1u, stats.values.count("slave/disk_percent"));
+  EXPECT_EQ(1u, snapshot.values.count("slave/disk_total"));
+  EXPECT_EQ(1u, snapshot.values.count("slave/disk_used"));
+  EXPECT_EQ(1u, snapshot.values.count("slave/disk_percent"));
 
   Shutdown();
 }
@@ -865,8 +893,8 @@ TEST_F(SlaveTest, StateEndpoint)
   Try<PID<Slave> > slave = StartSlave(flags);
   ASSERT_SOME(slave);
 
-  Future<process::http::Response> response =
-    process::http::get(slave.get(), "state.json");
+  Future<http::Response> response =
+    http::get(slave.get(), "state.json");
 
   AWAIT_READY(response);
 
@@ -983,7 +1011,7 @@ TEST_F(SlaveTest, TerminatingSlaveDoesNotReregister)
 
   // Send a ShutdownMessage instead of calling Stop() directly
   // to avoid blocking.
-  process::post(master.get(), slave.get(), ShutdownMessage());
+  post(master.get(), slave.get(), ShutdownMessage());
 
   // Advance the clock to trigger doReliableRegistration().
   Clock::advance(slave::REGISTER_RETRY_INTERVAL_MAX * 2);
@@ -1070,7 +1098,7 @@ TEST_F(SlaveTest, TerminalTaskContainerizerUpdateFails)
 
   // Set up the containerizer so the next update() will fail.
   EXPECT_CALL(containerizer, update(_, _))
-    .WillOnce(Return(process::Failure("update() failed")))
+    .WillOnce(Return(Failure("update() failed")))
     .WillRepeatedly(Return(Nothing()));
 
   EXPECT_CALL(exec, killTask(_, _))
@@ -1082,9 +1110,123 @@ TEST_F(SlaveTest, TerminalTaskContainerizerUpdateFails)
 
   AWAIT_READY(status3);
   EXPECT_EQ(TASK_KILLED, status3.get().state());
+  EXPECT_EQ(TaskStatus::SOURCE_EXECUTOR, status3.get().source());
 
   AWAIT_READY(status4);
   EXPECT_EQ(TASK_LOST, status4.get().state());
+  EXPECT_EQ(TaskStatus::SOURCE_SLAVE, status4.get().source());
+  EXPECT_EQ(TaskStatus::REASON_EXECUTOR_TERMINATED, status4.get().reason());
+
+  driver.stop();
+  driver.join();
+
+  Shutdown();
+}
+
+
+// This test verifies that the resources of a container will be
+// updated before tasks are sent to the executor.
+TEST_F(SlaveTest, ContainerUpdatedBeforeTaskReachesExecutor)
+{
+  // Start a master.
+  Try<PID<Master> > master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+  EXPECT_CALL(exec, registered(_, _, _, _));
+
+  TestContainerizer containerizer(&exec);
+
+  // Start a slave.
+  Try<PID<Slave> > slave = StartSlave(&containerizer);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get(), DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(_, _, _));
+
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(LaunchTasks(DEFAULT_EXECUTOR_INFO, 1, "1", "128", "*"))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  // This is used to determine which of the following finishes first:
+  // `containerizer->update` or `exec->launchTask`. We want to make
+  // sure that containerizer update always finishes before the task is
+  // sent to the executor.
+  Sequence sequence;
+
+  EXPECT_CALL(containerizer, update(_, _))
+    .InSequence(sequence)
+    .WillOnce(Return(Nothing()));
+
+  EXPECT_CALL(exec, launchTask(_, _))
+    .InSequence(sequence)
+    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status));
+
+  driver.start();
+
+  AWAIT_READY(status);
+  EXPECT_EQ(TASK_RUNNING, status.get().state());
+
+  driver.stop();
+  driver.join();
+
+  Shutdown();
+}
+
+
+// This test verifies the slave will destroy a container if updating
+// the container's resources fails during task launch.
+TEST_F(SlaveTest, TaskLaunchContainerizerUpdateFails)
+{
+  // Start a master.
+  Try<PID<Master> > master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+
+  TestContainerizer containerizer(&exec);
+
+  // Start a slave.
+  Try<PID<Slave> > slave = StartSlave(&containerizer);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get(), DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(_, _, _));
+
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(LaunchTasks(DEFAULT_EXECUTOR_INFO, 1, "1", "128", "*"))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  // The executor may not receive the ExecutorRegisteredMessage if the
+  // container is destroyed before that.
+  EXPECT_CALL(exec, registered(_, _, _, _))
+    .Times(AtMost(1));
+
+  // Set up the containerizer so update() will fail.
+  EXPECT_CALL(containerizer, update(_, _))
+    .WillOnce(Return(Failure("update() failed")))
+    .WillRepeatedly(Return(Nothing()));
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status));
+
+  driver.start();
+
+  AWAIT_READY(status);
+  EXPECT_EQ(TASK_LOST, status.get().state());
+  EXPECT_EQ(TaskStatus::SOURCE_SLAVE, status.get().source());
+  EXPECT_EQ(TaskStatus::REASON_EXECUTOR_TERMINATED, status.get().reason());
 
   driver.stop();
   driver.join();
@@ -1175,6 +1317,142 @@ TEST_F(SlaveTest, PingTimeoutSomePings)
 }
 
 
+// This test ensures that when slave removal rate limit is specified
+// a slave that fails health checks is removed after a permit is
+// provided by the rate limiter.
+TEST_F(SlaveTest, RateLimitSlaveShutdown)
+{
+  // Start a master.
+  shared_ptr<MockRateLimiter> slaveRemovalLimiter(new MockRateLimiter());
+  Try<PID<Master> > master = StartMaster(slaveRemovalLimiter);
+  ASSERT_SOME(master);
+
+  // Set these expectations up before we spawn the slave so that we
+  // don't miss the first PING.
+  Future<Message> ping = FUTURE_MESSAGE(Eq("PING"), _, _);
+
+  // Drop all the PONGs to simulate health check timeout.
+  DROP_MESSAGES(Eq("PONG"), _, _);
+
+  Future<SlaveRegisteredMessage> slaveRegisteredMessage =
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
+
+  // Start a slave.
+  Try<PID<Slave> > slave = StartSlave();
+  ASSERT_SOME(slave);
+
+  AWAIT_READY(slaveRegisteredMessage);
+
+  // Return a pending future from the rate limiter.
+  Future<Nothing> acquire;
+  Promise<Nothing> promise;
+  EXPECT_CALL(*slaveRemovalLimiter, acquire())
+    .WillOnce(DoAll(FutureSatisfy(&acquire),
+                    Return(promise.future())));
+
+  Future<ShutdownMessage> shutdown = FUTURE_PROTOBUF(ShutdownMessage(), _, _);
+
+  // Induce a health check failure of the slave.
+  Clock::pause();
+  uint32_t pings = 0;
+  while (true) {
+    AWAIT_READY(ping);
+    pings++;
+    if (pings == master::MAX_SLAVE_PING_TIMEOUTS) {
+      Clock::advance(master::SLAVE_PING_TIMEOUT);
+      break;
+    }
+    ping = FUTURE_MESSAGE(Eq("PING"), _, _);
+    Clock::advance(master::SLAVE_PING_TIMEOUT);
+  }
+
+  // The master should attempt to acquire a permit.
+  AWAIT_READY(acquire);
+
+  // The shutdown should not occur before the permit is satisfied.
+  Clock::settle();
+  ASSERT_TRUE(shutdown.isPending());
+
+  // Once the permit is satisfied, the shutdown message
+  // should be sent.
+  promise.set(Nothing());
+  AWAIT_READY(shutdown);
+}
+
+
+// This test verifies that when a slave responds to pings after the
+// slave observer has scheduled it for shutdown (due to health check
+// failure), the shutdown is cancelled.
+TEST_F(SlaveTest, CancelSlaveShutdown)
+{
+  // Start a master.
+  shared_ptr<MockRateLimiter> slaveRemovalLimiter(new MockRateLimiter());
+  Try<PID<Master> > master = StartMaster(slaveRemovalLimiter);
+  ASSERT_SOME(master);
+
+  // Set these expectations up before we spawn the slave so that we
+  // don't miss the first PING.
+  Future<Message> ping = FUTURE_MESSAGE(Eq("PING"), _, _);
+
+  // Drop all the PONGs to simulate health check timeout.
+  DROP_MESSAGES(Eq("PONG"), _, _);
+
+  // No shutdown should occur during the test!
+  EXPECT_NO_FUTURE_PROTOBUFS(ShutdownMessage(), _, _);
+
+  Future<SlaveRegisteredMessage> slaveRegisteredMessage =
+    FUTURE_PROTOBUF(SlaveRegisteredMessage(), _, _);
+
+  // Start a slave.
+  Try<PID<Slave> > slave = StartSlave();
+  ASSERT_SOME(slave);
+
+  AWAIT_READY(slaveRegisteredMessage);
+
+  // Return a pending future from the rate limiter.
+  Future<Nothing> acquire;
+  Promise<Nothing> promise;
+  EXPECT_CALL(*slaveRemovalLimiter, acquire())
+    .WillOnce(DoAll(FutureSatisfy(&acquire),
+                    Return(promise.future())));
+
+  // Induce a health check failure of the slave.
+  Clock::pause();
+  uint32_t pings = 0;
+  while (true) {
+    AWAIT_READY(ping);
+    pings++;
+    if (pings == master::MAX_SLAVE_PING_TIMEOUTS) {
+      Clock::advance(master::SLAVE_PING_TIMEOUT);
+      break;
+    }
+    ping = FUTURE_MESSAGE(Eq("PING"), _, _);
+    Clock::advance(master::SLAVE_PING_TIMEOUT);
+  }
+
+  // The master should attempt to acquire a permit.
+  AWAIT_READY(acquire);
+
+  // Settle to make sure the shutdown does not occur.
+  Clock::settle();
+
+  // Reset the filters to allow pongs from the slave.
+  filter(NULL);
+
+  // Advance clock enough to do a ping pong.
+  Clock::advance(master::SLAVE_PING_TIMEOUT);
+  Clock::settle();
+
+  // The master should have tried to cancel the removal.
+  ASSERT_TRUE(promise.future().hasDiscard());
+
+  // Allow the cancelation and settle the clock to ensure a shutdown
+  // does not occur.
+  promise.discard();
+  Clock::settle();
+}
+
+
 // This test ensures that a killTask() can happen between runTask()
 // and _runTask() and then gets "handled properly". This means that
 // the task never gets started, but also does not get lost. The end
@@ -1194,7 +1472,7 @@ TEST_F(SlaveTest, KillTaskBetweenRunTaskParts)
   StandaloneMasterDetector detector(master.get());
 
   MockSlave slave(CreateSlaveFlags(), &detector, &containerizer);
-  process::spawn(slave);
+  spawn(slave);
 
   MockScheduler sched;
   MesosSchedulerDriver driver(
@@ -1285,8 +1563,8 @@ TEST_F(SlaveTest, KillTaskBetweenRunTaskParts)
   driver.stop();
   driver.join();
 
-  process::terminate(slave);
-  process::wait(slave);
+  terminate(slave);
+  wait(slave);
 
   Shutdown(); // Must shutdown before 'containerizer' gets deallocated.
 }
@@ -1389,3 +1667,146 @@ TEST_F(SlaveTest, ReregisterWithStatusUpdateTaskState)
 
   Shutdown();
 }
+
+
+// This test verifies that label values can be set for tasks and that
+// they are exposed over the slave state endpoint.
+TEST_F(SlaveTest, TaskLabels)
+{
+  Try<PID<Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+
+  TestContainerizer containerizer(&exec);
+
+  Try<PID<Slave>> slave = StartSlave(&containerizer);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get(), DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .Times(1);
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  EXPECT_NE(0u, offers.get().size());
+
+  TaskInfo task;
+  task.set_name("");
+  task.mutable_task_id()->set_value("1");
+  task.mutable_slave_id()->MergeFrom(offers.get()[0].slave_id());
+  task.mutable_resources()->MergeFrom(offers.get()[0].resources());
+  task.mutable_executor()->MergeFrom(DEFAULT_EXECUTOR_INFO);
+
+  // Add three labels to the task (two of which share the same key).
+  Labels* labels = task.mutable_labels();
+
+  Label* label1 = labels->add_labels();
+  label1->set_key("foo");
+  label1->set_value("bar");
+
+  Label* label2 = labels->add_labels();
+  label2->set_key("bar");
+  label2->set_value("baz");
+
+  Label* label3 = labels->add_labels();
+  label3->set_key("bar");
+  label3->set_value("qux");
+
+  vector<TaskInfo> tasks;
+  tasks.push_back(task);
+
+  EXPECT_CALL(exec, registered(_, _, _, _))
+    .Times(1);
+
+  EXPECT_CALL(exec, launchTask(_, _))
+    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
+
+  Future<Nothing> update;
+  EXPECT_CALL(containerizer,
+              update(_, Resources(offers.get()[0].resources())))
+    .WillOnce(DoAll(FutureSatisfy(&update),
+                    Return(Nothing())));
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status));
+
+  driver.launchTasks(offers.get()[0].id(), tasks);
+
+  AWAIT_READY(status);
+  EXPECT_EQ(TASK_RUNNING, status.get().state());
+
+  AWAIT_READY(update);
+
+  // Verify label key and value in slave state.json.
+  Future<http::Response> response =
+    http::get(slave.get(), "state.json");
+  AWAIT_READY(response);
+
+  EXPECT_SOME_EQ(
+      "application/json",
+      response.get().headers.get("Content-Type"));
+
+  Try<JSON::Object> parse = JSON::parse<JSON::Object>(response.get().body);
+  ASSERT_SOME(parse);
+
+  Result<JSON::Array> labelsObject = parse.get().find<JSON::Array>(
+      "frameworks[0].executors[0].tasks[0].labels");
+  EXPECT_SOME(labelsObject);
+
+  JSON::Array labelsObject_ = labelsObject.get();
+
+  // Verify the content of 'foo:bar' pair.
+  Try<JSON::Value> expected = JSON::parse(
+      "{"
+      "  \"key\":\"foo\","
+      "  \"value\":\"bar\""
+      "}");
+
+  ASSERT_SOME(expected);
+  EXPECT_EQ(labelsObject_.values[0], expected.get());
+
+
+  // Verify the content of 'bar:baz' pair.
+  expected = JSON::parse(
+      "{"
+      "  \"key\":\"bar\","
+      "  \"value\":\"baz\""
+      "}");
+
+  ASSERT_SOME(expected);
+  EXPECT_EQ(labelsObject_.values[1], expected.get());
+
+
+  // Verify the content of 'bar:qux' pair.
+  expected = JSON::parse(
+      "{"
+      "  \"key\":\"bar\","
+      "  \"value\":\"qux\""
+      "}");
+
+  ASSERT_SOME(expected);
+  EXPECT_EQ(labelsObject_.values[2], expected.get());
+
+  EXPECT_CALL(exec, shutdown(_))
+    .Times(AtMost(1));
+
+  driver.stop();
+  driver.join();
+
+  Shutdown(); // Must shutdown before 'containerizer' gets deallocated.
+}
+
+} // namespace tests {
+} // namespace internal {
+} // namespace mesos {

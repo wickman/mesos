@@ -30,18 +30,26 @@ PICOJSON = 3rdparty/picojson-$(PICOJSON_VERSION)
 noinst_LTLIBRARIES = libprocess.la
 
 libprocess_la_SOURCES =		\
+  src/clock.cpp			\
   src/config.hpp		\
   src/decoder.hpp		\
   src/encoder.hpp		\
+  src/event_loop.hpp		\
   src/gate.hpp			\
   src/help.cpp			\
   src/http.cpp			\
+  src/io.cpp			\
   src/latch.cpp			\
+  src/logging.cpp		\
   src/metrics/metrics.cpp	\
   src/pid.cpp			\
+  src/poll_socket.cpp		\
+  src/poll_socket.hpp		\
+  src/profiler.cpp		\
   src/process.cpp		\
   src/process_reference.hpp	\
   src/reap.cpp			\
+  src/socket.cpp		\
   src/subprocess.cpp		\
   src/synchronized.hpp		\
   src/timeseries.cpp
@@ -53,6 +61,18 @@ libprocess_la_CPPFLAGS =		\
   -I$(LIBEV)				\
   -I$(PICOJSON)				\
   $(AM_CPPFLAGS)
+
+if ENABLE_LIBEVENT
+libprocess_la_SOURCES +=	\
+    src/libevent.hpp		\
+    src/libevent.cpp		\
+    src/libevent_poll.cpp
+else
+  libprocess_la_SOURCES +=	\
+    src/libev.hpp		\
+    src/libev.cpp		\
+    src/libev_poll.cpp
+endif
 
 if WITH_BUNDLED_GLOG
   libprocess_la_CPPFLAGS += -I$(GLOG)/src
@@ -70,16 +90,20 @@ else
   HTTP_PARSER_LIB = -lhttp_parser
 endif
 
-if WITH_BUNDLED_LIBEV
-  LIBEV_LIB = $(LIBEV)/libev.la
+if ENABLE_LIBEVENT
+  EVENT_LIB = -levent -levent_pthreads
 else
-  LIBEV_LIB = -lev
+if WITH_BUNDLED_LIBEV
+  EVENT_LIB = $(LIBEV)/libev.la
+else
+  EVENT_LIB = -lev
+endif
 endif
 
 libprocess_la_LIBADD =			\
   $(LIBGLOG)				\
   $(HTTP_PARSER_LIB)			\
-  $(LIBEV_LIB)
+  $(EVENT_LIB)
 
 if HAS_GPERFTOOLS
 libprocess_la_CPPFLAGS += -I$(GPERFTOOLS)/src
@@ -94,6 +118,7 @@ tests_SOURCES =							\
   src/tests/encoder_tests.cpp					\
   src/tests/http_tests.cpp					\
   src/tests/io_tests.cpp					\
+  src/tests/limiter_tests.cpp					\
   src/tests/main.cpp						\
   src/tests/mutex_tests.cpp					\
   src/tests/metrics_tests.cpp					\
@@ -120,7 +145,7 @@ tests_LDADD =				\
   libprocess.la				\
   $(LIBGLOG)				\
   $(HTTP_PARSER_LIB)			\
-  $(LIBEV_LIB)
+  $(EVENT_LIB)
 
 benchmarks_SOURCES =			\
   src/tests/benchmarks.cpp
@@ -136,7 +161,7 @@ benchmarks_LDADD =			\
   libprocess.la				\
   $(LIBGLOG)				\
   $(HTTP_PARSER_LIB)			\
-  $(LIBEV_LIB)
+  $(EVENT_LIB)
 
 # We use a check-local target for now to avoid the parallel test
 # runner that ships with newer versions of autotools.

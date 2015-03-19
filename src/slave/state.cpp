@@ -15,6 +15,8 @@
 #include <stout/protobuf.hpp>
 #include <stout/try.hpp>
 
+#include "messages/messages.hpp"
+
 #include "slave/paths.hpp"
 #include "slave/state.hpp"
 
@@ -28,7 +30,7 @@ using std::string;
 using std::max;
 
 
-Result<SlaveState> recover(const string& rootDir, bool strict)
+Result<State> recover(const string& rootDir, bool strict)
 {
   LOG(INFO) << "Recovering state from '" << rootDir << "'";
 
@@ -39,7 +41,21 @@ Result<SlaveState> recover(const string& rootDir, bool strict)
     return None();
   }
 
-  // Did the machine reboot?
+  // Now, start to recover state from 'rootDir'.
+  State state;
+
+  // Recover resources regardless whether the host has rebooted.
+  Try<ResourcesState> resources = ResourcesState::recover(rootDir, strict);
+  if (resources.isError()) {
+    return Error(resources.error());
+  }
+
+  // TODO(jieyu): Do not set 'state.resources' if we cannot find the
+  // resources checkpoint file.
+  state.resources = resources.get();
+
+  // Did the machine reboot? No need to recover slave state if the
+  // machine has rebooted.
   if (os::exists(paths::getBootIdPath(rootDir))) {
     Try<string> read = os::read(paths::getBootIdPath(rootDir));
     if (read.isSome()) {
@@ -48,7 +64,7 @@ Result<SlaveState> recover(const string& rootDir, bool strict)
 
       if (id.get() != strings::trim(read.get())) {
         LOG(INFO) << "Slave host rebooted";
-        return None();
+        return state;
       }
     }
   }
@@ -60,7 +76,7 @@ Result<SlaveState> recover(const string& rootDir, bool strict)
     // The slave was asked to shutdown or died before it registered
     // and had a chance to create the "latest" symlink.
     LOG(INFO) << "Failed to find the latest slave from '" << rootDir << "'";
-    return None();
+    return state;
   }
 
   // Get the latest slave id.
@@ -75,12 +91,14 @@ Result<SlaveState> recover(const string& rootDir, bool strict)
   SlaveID slaveId;
   slaveId.set_value(os::basename(directory.get()).get());
 
-  Try<SlaveState> state = SlaveState::recover(rootDir, slaveId, strict);
-  if (state.isError()) {
-    return Error(state.error());
+  Try<SlaveState> slave = SlaveState::recover(rootDir, slaveId, strict);
+  if (slave.isError()) {
+    return Error(slave.error());
   }
 
-  return state.get();
+  state.slave = slave.get();
+
+  return state;
 }
 
 
@@ -95,8 +113,8 @@ Try<SlaveState> SlaveState::recover(
   // Read the slave info.
   const string& path = paths::getSlaveInfoPath(rootDir, slaveId);
   if (!os::exists(path)) {
-    // This could happen if the slave died before it registered
-    // with the master.
+    // This could happen if the slave died before it registered with
+    // the master.
     LOG(WARNING) << "Failed to find slave info file '" << path << "'";
     return state;
   }
@@ -125,8 +143,7 @@ Try<SlaveState> SlaveState::recover(
   state.info = slaveInfo.get();
 
   // Find the frameworks.
-  Try<list<string> > frameworks = os::glob(
-      strings::format(paths::FRAMEWORK_PATH, rootDir, slaveId, "*").get());
+  Try<list<string> > frameworks = paths::getFrameworkPaths(rootDir, slaveId);
 
   if (frameworks.isError()) {
     return Error("Failed to find frameworks for slave " + slaveId.value() +
@@ -168,8 +185,8 @@ Try<FrameworkState> FrameworkState::recover(
   string path = paths::getFrameworkInfoPath(rootDir, slaveId, frameworkId);
   if (!os::exists(path)) {
     // This could happen if the slave died after creating the
-    // framework directory but before it checkpointed the
-    // framework info.
+    // framework directory but before it checkpointed the framework
+    // info.
     LOG(WARNING) << "Failed to find framework info file '" << path << "'";
     return state;
   }
@@ -233,8 +250,8 @@ Try<FrameworkState> FrameworkState::recover(
   state.pid = process::UPID(pid.get());
 
   // Find the executors.
-  Try<list<string> > executors = os::glob(strings::format(
-      paths::EXECUTOR_PATH, rootDir, slaveId, frameworkId, "*").get());
+  Try<list<string> > executors =
+    paths::getExecutorPaths(rootDir, slaveId, frameworkId);
 
   if (executors.isError()) {
     return Error(
@@ -275,13 +292,11 @@ Try<ExecutorState> ExecutorState::recover(
   string message;
 
   // Find the runs.
-  Try<list<string> > runs = os::glob(strings::format(
-      paths::EXECUTOR_RUN_PATH,
+  Try<list<string> > runs = paths::getExecutorRunPaths(
       rootDir,
       slaveId,
       frameworkId,
-      executorId,
-      "*").get());
+      executorId);
 
   if (runs.isError()) {
     return Error("Failed to find runs for executor '" + executorId.value() +
@@ -394,14 +409,12 @@ Try<RunState> RunState::recover(
   state.completed = os::exists(path);
 
   // Find the tasks.
-  Try<list<string> > tasks = os::glob(strings::format(
-      paths::TASK_PATH,
+  Try<list<string> > tasks = paths::getTaskPaths(
       rootDir,
       slaveId,
       frameworkId,
       executorId,
-      containerId,
-      "*").get());
+      containerId);
 
   if (tasks.isError()) {
     return Error(
@@ -556,14 +569,15 @@ Try<TaskState> TaskState::recover(
   path = paths::getTaskUpdatesPath(
       rootDir, slaveId, frameworkId, executorId, containerId, taskId);
   if (!os::exists(path)) {
-    // This could happen if the slave died before it checkpointed
-    // any status updates for this task.
+    // This could happen if the slave died before it checkpointed any
+    // status updates for this task.
     LOG(WARNING) << "Failed to find status updates file '" << path << "'";
     return state;
   }
 
-  // Open the status updates file for reading and writing (for truncating).
-  Try<int> fd = os::open(path, O_RDWR);
+  // Open the status updates file for reading and writing (for
+  // truncating).
+  Try<int> fd = os::open(path, O_RDWR | O_CLOEXEC);
 
   if (fd.isError()) {
     message = "Failed to open status updates file '" + path +
@@ -597,15 +611,16 @@ Try<TaskState> TaskState::recover(
   }
 
   // Always truncate the file to contain only valid updates.
-  // NOTE: This is safe even though we ignore partial protobuf
-  // read errors above, because the 'fd' is properly set to the
-  // end of the last valid update by 'protobuf::read()'.
+  // NOTE: This is safe even though we ignore partial protobuf read
+  // errors above, because the 'fd' is properly set to the end of the
+  // last valid update by 'protobuf::read()'.
   if (ftruncate(fd.get(), lseek(fd.get(), 0, SEEK_CUR)) != 0) {
     return ErrnoError(
         "Failed to truncate status updates file '" + path + "'");
   }
 
-  // After reading a non-corrupted updates file, 'record' should be 'none'.
+  // After reading a non-corrupted updates file, 'record' should be
+  // 'none'.
   if (record.isError()) {
     message = "Failed to read status updates file  '" + path +
               "': " + record.error();
@@ -639,48 +654,84 @@ Try<TaskState> TaskState::recover(
 }
 
 
-// Helpers to checkpoint string/protobuf to disk, with necessary error checking.
-
-Try<Nothing> checkpoint(
-    const string& path,
-    const google::protobuf::Message& message)
+Try<ResourcesState> ResourcesState::recover(
+    const std::string& rootDir,
+    bool strict)
 {
-  // Create the base directory.
-  Try<Nothing> result = os::mkdir(os::dirname(path).get());
-  if (result.isError()) {
-    return Error("Failed to create directory '" + os::dirname(path).get() +
-                 "': " + result.error());
+  ResourcesState state;
+
+  const string& path = paths::getResourcesInfoPath(rootDir);
+  if (!os::exists(path)) {
+    LOG(INFO) << "Failed to find resources file '" << path << "'";
+    return state;
   }
 
-  // Now checkpoint the protobuf to disk.
-  result = ::protobuf::write(path, message);
-  if (result.isError()) {
-    return Error("Failed to checkpoint \n" + message.DebugString() +
-                 "\n to '" + path + "': " + result.error());
+  Try<int> fd = os::open(path, O_RDWR | O_CLOEXEC);
+  if (fd.isError()) {
+    string message =
+      "Failed to open resources file '" + path + "': " + fd.error();
+
+    if (strict) {
+      return Error(message);
+    } else {
+      LOG(WARNING) << message;
+      state.errors++;
+      return state;
+    }
   }
 
-  return Nothing();
+  Result<Resource> resource = None();
+  while (true) {
+    // Ignore errors due to partial protobuf read and enable undoing
+    // failed reads by reverting to the previous seek position.
+    resource = ::protobuf::read<Resource>(fd.get(), true, true);
+    if (!resource.isSome()) {
+      break;
+    }
+
+    state.resources += resource.get();
+  }
+
+  // Always truncate the file to contain only valid resources.
+  // NOTE: This is safe even though we ignore partial protobuf read
+  // errors above, because the 'fd' is properly set to the end of the
+  // last valid resource by 'protobuf::read()'.
+  if (ftruncate(fd.get(), lseek(fd.get(), 0, SEEK_CUR)) != 0) {
+    return ErrnoError("Failed to truncate resources file '" + path + "'");
+  }
+
+  // After reading a non-corrupted resources file, 'record' should be
+  // 'none'.
+  if (resource.isError()) {
+    string message =
+      "Failed to read resources file  '" + path + "': " + resource.error();
+
+    if (strict) {
+      return Error(message);
+    } else {
+      LOG(WARNING) << message;
+      state.errors++;
+      return state;
+    }
+  }
+
+  Try<Nothing> close = os::close(fd.get());
+  if (close.isError()) {
+    string message =
+      "Failed to close resources file '" + path + "': " + close.error();
+
+    if (strict) {
+      return Error(message);
+    } else {
+      LOG(WARNING) << message;
+      state.errors++;
+      return state;
+    }
+  }
+
+  return state;
 }
 
-
-Try<Nothing> checkpoint(const std::string& path, const std::string& message)
-{
-  // Create the base directory.
-  Try<Nothing> result = os::mkdir(os::dirname(path).get());
-  if (result.isError()) {
-    return Error("Failed to create directory '" + os::dirname(path).get() +
-                 "': " + result.error());
-  }
-
-  // Now checkpoint the message to disk.
-  result = os::write(path, message);
-  if (result.isError()) {
-    return Error("Failed to checkpoint '" + message + "' to '" + path +
-                 "': " + result.error());
-  }
-
-  return Nothing();
-}
 
 } // namespace state {
 } // namespace slave {

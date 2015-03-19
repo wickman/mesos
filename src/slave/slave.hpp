@@ -28,15 +28,15 @@
 #include <boost/circular_buffer.hpp>
 
 #include <mesos/resources.hpp>
+#include <mesos/type_utils.hpp>
+
+#include <mesos/module/authenticatee.hpp>
 
 #include <process/http.hpp>
 #include <process/future.hpp>
 #include <process/owned.hpp>
 #include <process/process.hpp>
 #include <process/protobuf.hpp>
-
-#include <process/metrics/counter.hpp>
-#include <process/metrics/gauge.hpp>
 
 #include <stout/bytes.hpp>
 #include <stout/linkedhashmap.hpp>
@@ -53,13 +53,13 @@
 #include "slave/containerizer/containerizer.hpp"
 #include "slave/flags.hpp"
 #include "slave/gc.hpp"
+#include "slave/metrics.hpp"
 #include "slave/monitor.hpp"
 #include "slave/paths.hpp"
 #include "slave/state.hpp"
 
 #include "common/attributes.hpp"
 #include "common/protobuf_utils.hpp"
-#include "common/type_utils.hpp"
 
 #include "files/files.hpp"
 
@@ -69,10 +69,6 @@ namespace mesos {
 namespace internal {
 
 class MasterDetector; // Forward declaration.
-
-namespace cram_md5 {
-class Authenticatee;
-} // namespace cram_md5 {
 
 namespace slave {
 
@@ -104,7 +100,7 @@ public:
       const SlaveID& slaveId,
       const std::vector<ReconcileTasksMessage>& reconciliations);
 
-  void doReliableRegistration(const Duration& duration);
+  void doReliableRegistration(Duration maxBackoff);
 
   // Made 'virtual' for Slave mocking.
   virtual void runTask(
@@ -142,6 +138,8 @@ public:
 
   void updateFramework(const FrameworkID& frameworkId, const std::string& pid);
 
+  void checkpointResources(const std::vector<Resource>& checkpointedResources);
+
   void registerExecutor(
       const process::UPID& from,
       const FrameworkID& frameworkId,
@@ -157,6 +155,12 @@ public:
       const ExecutorID& executorId,
       const std::vector<TaskInfo>& tasks,
       const std::vector<StatusUpdate>& updates);
+
+  void _reregisterExecutor(
+      const process::Future<Nothing>& future,
+      const FrameworkID& frameworkId,
+      const ExecutorID& executorId,
+      const ContainerID& containerId);
 
   void executorMessage(
       const SlaveID& slaveId,
@@ -177,7 +181,9 @@ public:
   // after the update is successfully handled. If pid == UPID()
   // no ACK is sent. The latter is used by the slave to send
   // status updates it generated (e.g., TASK_LOST).
-  void statusUpdate(const StatusUpdate& update, const process::UPID& pid);
+  // NOTE: StatusUpdate is passed by value because it is modified
+  // to ensure source field is set.
+  void statusUpdate(StatusUpdate update, const process::UPID& pid);
 
   // Continue handling the status update after optionally updating the
   // container's resources.
@@ -261,6 +267,19 @@ public:
   virtual void finalize();
   virtual void exited(const process::UPID& pid);
 
+  // This is called when the resource limits of the container have
+  // been updated for the given tasks. If the update is successful, we
+  // flush the given tasks to the executor by sending RunTaskMessages.
+  // TODO(jieyu): Consider renaming it to '__runTasks' once the slave
+  // starts to support launching multiple tasks in one call (i.e.,
+  // multi-tasks version of 'runTask').
+  void runTasks(
+      const process::Future<Nothing>& future,
+      const FrameworkID& frameworkId,
+      const ExecutorID& executorId,
+      const ContainerID& containerId,
+      const std::list<TaskInfo>& tasks);
+
   void fileAttached(const process::Future<Nothing>& result,
                     const std::string& path);
 
@@ -305,7 +324,7 @@ public:
   void checkDiskUsage();
 
   // Recovers the slave, status update manager and isolator.
-  process::Future<Nothing> recover(const Result<state::SlaveState>& state);
+  process::Future<Nothing> recover(const Result<state::State>& state);
 
   // This is called after 'recover()'. If 'flags.reconnect' is
   // 'reconnect', the slave attempts to reconnect to any old live
@@ -319,7 +338,8 @@ public:
       const Option<state::SlaveState>& state);
 
   // This is called when recovery finishes.
-  void __recover(const process::Future<Nothing>& future);
+  // Made 'virtual' for Slave mocking.
+  virtual void __recover(const process::Future<Nothing>& future);
 
   // Helper to recover a framework from the specified state.
   void recoverFramework(const state::FrameworkState& state);
@@ -352,10 +372,6 @@ private:
     process::Future<process::http::Response> health(
         const process::http::Request& request);
 
-    // /slave/stats.json
-    process::Future<process::http::Response> stats(
-        const process::http::Request& request);
-
     // /slave/state.json
     process::Future<process::http::Response> state(
         const process::http::Request& request);
@@ -368,6 +384,7 @@ private:
 
   friend struct Framework;
   friend struct Executor;
+  friend struct Metrics;
 
   Slave(const Slave&);              // No copying.
   Slave& operator = (const Slave&); // No assigning.
@@ -396,6 +413,8 @@ private:
   double _executors_running();
   double _executors_terminating();
 
+  double _executor_directory_max_allowed_age_secs();
+
   void sendExecutorTerminatedStatusUpdate(
       const TaskID& taskId,
       const Future<containerizer::Termination>& termination,
@@ -405,6 +424,9 @@ private:
   const Flags flags;
 
   SlaveInfo info;
+
+  // Resources that are checkpointed by the slave.
+  Resources checkpointedResources;
 
   Option<process::UPID> master;
 
@@ -418,53 +440,7 @@ private:
 
   Files* files;
 
-  // Statistics (initialized in Slave::initialize).
-  struct
-  {
-    uint64_t tasks[TaskState_ARRAYSIZE];
-    uint64_t validStatusUpdates;
-    uint64_t invalidStatusUpdates;
-    uint64_t validFrameworkMessages;
-    uint64_t invalidFrameworkMessages;
-  } stats;
-
-  struct Metrics
-  {
-    Metrics(const Slave& slave);
-
-    ~Metrics();
-
-    process::metrics::Gauge uptime_secs;
-    process::metrics::Gauge registered;
-
-    process::metrics::Counter recovery_errors;
-
-    process::metrics::Gauge frameworks_active;
-
-    process::metrics::Gauge tasks_staging;
-    process::metrics::Gauge tasks_starting;
-    process::metrics::Gauge tasks_running;
-    process::metrics::Counter tasks_finished;
-    process::metrics::Counter tasks_failed;
-    process::metrics::Counter tasks_killed;
-    process::metrics::Counter tasks_lost;
-
-    process::metrics::Gauge executors_registering;
-    process::metrics::Gauge executors_running;
-    process::metrics::Gauge executors_terminating;
-    process::metrics::Counter executors_terminated;
-
-    process::metrics::Counter valid_status_updates;
-    process::metrics::Counter invalid_status_updates;
-
-    process::metrics::Counter valid_framework_messages;
-    process::metrics::Counter invalid_framework_messages;
-
-    // Resource metrics.
-    std::vector<process::metrics::Gauge> resources_total;
-    std::vector<process::metrics::Gauge> resources_used;
-    std::vector<process::metrics::Gauge> resources_percent;
-  } metrics;
+  Metrics metrics;
 
   double _resources_total(const std::string& name);
   double _resources_used(const std::string& name);
@@ -496,7 +472,10 @@ private:
 
   Option<Credential> credential;
 
-  cram_md5::Authenticatee* authenticatee;
+  // Authenticatee name as supplied via flags.
+  std::string authenticateeName;
+
+  Authenticatee* authenticatee;
 
   // Indicates if an authentication attempt is in progress.
   Option<Future<bool> > authenticating;
@@ -506,6 +485,10 @@ private:
 
   // Indicates if a new authentication attempt should be enforced.
   bool reauthenticate;
+
+  // Maximum age of executor directories. Will be recomputed
+  // periodically every flags.disk_watch_interval.
+  Duration executorDirectoryMaxAllowedAge;
 };
 
 
@@ -523,7 +506,7 @@ struct Executor
   ~Executor();
 
   Task* addTask(const TaskInfo& task);
-  void terminateTask(const TaskID& taskId, const mesos::TaskState& state);
+  void terminateTask(const TaskID& taskId, const mesos::TaskStatus& status);
   void completeTask(const TaskID& taskId);
   void checkpointExecutor();
   void checkpointTask(const TaskInfo& task);

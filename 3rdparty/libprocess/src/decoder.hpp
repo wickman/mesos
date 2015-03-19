@@ -23,7 +23,7 @@ namespace process {
 class DataDecoder
 {
 public:
-  explicit DataDecoder(const Socket& _s)
+  explicit DataDecoder(const network::Socket& _s)
     : s(_s), failure(false), request(NULL)
   {
     settings.on_message_begin = &DataDecoder::on_message_begin;
@@ -67,7 +67,7 @@ public:
     return failure;
   }
 
-  Socket socket() const
+  network::Socket socket() const
   {
     return s;
   }
@@ -120,12 +120,16 @@ private:
 //     std::cout << "http::Request:" << std::endl;
 //     std::cout << "  method: " << decoder->request->method << std::endl;
 //     std::cout << "  path: " << decoder->request->path << std::endl;
+
     // Parse the query key/values.
-    Try<std::string> decoded = http::decode(decoder->query);
+    Try<hashmap<std::string, std::string>> decoded =
+      http::query::decode(decoder->query);
+
     if (decoded.isError()) {
       return 1;
     }
-    decoder->request->query = http::query::parse(decoded.get());
+
+    decoder->request->query =  decoded.get();
 
     Option<std::string> encoding =
       decoder->request->headers.get("Content-Encoding");
@@ -240,7 +244,7 @@ private:
     return 0;
   }
 
-  const Socket s; // The socket this decoder is associated with.
+  const network::Socket s; // The socket this decoder is associated with.
 
   bool failure;
 

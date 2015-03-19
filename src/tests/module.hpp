@@ -21,6 +21,8 @@
 
 #include <string>
 
+#include <mesos/module/module.hpp>
+
 #include <stout/try.hpp>
 
 #include "logging/flags.hpp"
@@ -40,7 +42,11 @@ namespace tests {
 enum ModuleID
 {
   TestMemIsolator,
-  TestCpuIsolator
+  TestCpuIsolator,
+  TestCRAMMD5Authenticatee,
+  TestCRAMMD5Authenticator,
+  TestHook,
+  TestAnonymous
 };
 
 
@@ -55,13 +61,18 @@ class Module
 public:
   // Create is used by the type_param'ed tests.  T here denotes the
   // module type, whereas N denotes the module name.
-  static Try<T*> create(logging::Flags flags)
+  static Try<T*> create()
   {
     Try<std::string> moduleName = getModuleName(N);
     if (moduleName.isError()) {
       return Error(moduleName.error());
     }
     return mesos::modules::ModuleManager::create<T>(moduleName.get());
+  }
+
+  static Try<T*> create(logging::Flags flags)
+  {
+    return create();
   }
 };
 

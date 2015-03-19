@@ -47,18 +47,18 @@ using std::vector;
 namespace routing {
 namespace route {
 
-Try<vector<Rule> > table()
+Try<vector<Rule>> table()
 {
-  Try<Netlink<struct nl_sock> > sock = routing::socket();
-  if (sock.isError()) {
-    return Error(sock.error());
+  Try<Netlink<struct nl_sock>> socket = routing::socket();
+  if (socket.isError()) {
+    return Error(socket.error());
   }
 
   // Dump all the routes (for IPv4) from kernel.
   struct nl_cache* c = NULL;
-  int err = rtnl_route_alloc_cache(sock.get().get(), AF_INET, 0, &c);
-  if (err != 0) {
-    return Error(nl_geterror(err));
+  int error = rtnl_route_alloc_cache(socket.get().get(), AF_INET, 0, &c);
+  if (error != 0) {
+    return Error(nl_geterror(error));
   }
 
   Netlink<struct nl_cache> cache(c);
@@ -76,22 +76,22 @@ Try<vector<Rule> > table()
         rtnl_route_get_nnexthops(route) == 1) {
       CHECK_EQ(AF_INET, rtnl_route_get_family(route));
 
-      // Get the destination IP if exists.
-      Option<net::IP> destination;
+      // Get the destination IP network if exists.
+      Option<net::IPNetwork> destination;
       struct nl_addr* dst = rtnl_route_get_dst(route);
       if (dst != NULL && nl_addr_get_len(dst) != 0) {
         struct in_addr* addr = (struct in_addr*) nl_addr_get_binary_addr(dst);
-
-        Try<net::IP> ip = net::IP::fromAddressPrefix(
-            ntohl(addr->s_addr),
+        Try<net::IPNetwork> network = net::IPNetwork::create(
+            net::IP(*addr),
             nl_addr_get_prefixlen(dst));
 
-        if (ip.isError()) {
+        if (network.isError()) {
           return Error(
-              "Invalid IP format from the routing table: " + ip.error());
+              "Invalid IP network format from the routing table: " +
+              network.error());
         }
 
-        destination = ip.get();
+        destination = network.get();
       }
 
       // Get the default gateway if exists.
@@ -100,7 +100,7 @@ Try<vector<Rule> > table()
       struct nl_addr* gw = rtnl_route_nh_get_gateway(CHECK_NOTNULL(hop));
       if (gw != NULL && nl_addr_get_len(gw) != 0) {
         struct in_addr* addr = (struct in_addr*) nl_addr_get_binary_addr(gw);
-        gateway = net::IP(ntohl(addr->s_addr));
+        gateway = net::IP(*addr);
       }
 
       // Get the destination link.
@@ -122,7 +122,7 @@ Try<vector<Rule> > table()
 
 Result<net::IP> defaultGateway()
 {
-  Try<vector<Rule> > rules = table();
+  Try<vector<Rule>> rules = table();
   if (rules.isError()) {
     return Error("Failed to get the routing table: " + rules.error());
   }

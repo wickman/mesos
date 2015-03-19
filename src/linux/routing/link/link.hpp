@@ -28,7 +28,7 @@
 #include <process/future.hpp>
 
 #include <stout/hashmap.hpp>
-#include <stout/net.hpp>
+#include <stout/mac.hpp>
 #include <stout/nothing.hpp>
 #include <stout/option.hpp>
 #include <stout/result.hpp>
@@ -111,7 +111,7 @@ Try<bool> setMTU(const std::string& link, unsigned int mtu);
 
 
 // Returns the statistics of the link.
-Result<hashmap<std::string, uint64_t> > statistics(const std::string& link);
+Result<hashmap<std::string, uint64_t>> statistics(const std::string& link);
 
 } // namespace link {
 } // namespace routing {

@@ -68,11 +68,11 @@ Try<Nothing> encode<icmp::Classifier>(
   // ICMP packets are one type of IP packets.
   rtnl_cls_set_protocol(cls.get(), ETH_P_IP);
 
-  int err = rtnl_tc_set_kind(TC_CAST(cls.get()), "u32");
-  if (err != 0) {
+  int error = rtnl_tc_set_kind(TC_CAST(cls.get()), "u32");
+  if (error != 0) {
     return Error(
         "Failed to set the kind of the classifier: " +
-        string(nl_geterror(err)));
+        string(nl_geterror(error)));
   }
 
   // To avoid confusion, we only use u32 selectors which are used to
@@ -88,32 +88,37 @@ Try<Nothing> encode<icmp::Classifier>(
   uint32_t mask = 0x00ff0000; // Ignore offset 8, 10, 11.
 
   // To match ICMP packets (protocol = 1).
-  err = rtnl_u32_add_key(
+  error = rtnl_u32_add_key(
       cls.get(),
       htonl(protocol),
       htonl(mask),
       8, // Offset from which to start matching.
       0);
 
-  if (err != 0) {
+  if (error != 0) {
     return Error(
         "Failed to add selector for IP protocol: " +
-        string(nl_geterror(err)));
+        string(nl_geterror(error)));
   }
 
   if (classifier.destinationIP().isSome()) {
+    Try<struct in_addr> in = classifier.destinationIP().get().in();
+    if (in.isError()) {
+      return Error("Destination IP is not an IPv4 address");
+    }
+
     // To match those IP packets that have the given destination IP.
-    err = rtnl_u32_add_key(
+    error = rtnl_u32_add_key(
         cls.get(),
-        htonl(classifier.destinationIP().get().address()),
+        in.get().s_addr,
         htonl(0xffffffff),
         16, // Offset from which to start matching.
         0);
 
-    if (err != 0) {
+    if (error != 0) {
       return Error(
           "Failed to add selector for destination IP address: " +
-          string(nl_geterror(err)));
+           string(nl_geterror(error)));
     }
   }
 
@@ -145,7 +150,7 @@ Result<icmp::Classifier> decode<icmp::Classifier>(
     int offsetmask;
 
     // Decode a selector from the libnl filter 'cls'.
-    int err = rtnl_u32_get_key(
+    int error = rtnl_u32_get_key(
         cls.get(),
         i,
         &value,
@@ -153,17 +158,17 @@ Result<icmp::Classifier> decode<icmp::Classifier>(
         &offset,
         &offsetmask);
 
-    if (err != 0) {
-      if (err == -NLE_INVAL) {
+    if (error != 0) {
+      if (error == -NLE_INVAL) {
         // This is the case where cls does not have a u32 selector. In
         // that case, we just return None.
         return None();
-      } else if (err == -NLE_RANGE) {
+      } else if (error == -NLE_RANGE) {
         break;
       } else {
         return Error(
             "Failed to decode a u32 selector: " +
-            string(nl_geterror(err)));
+            string(nl_geterror(error)));
       }
     }
 
@@ -269,7 +274,7 @@ Try<bool> update(
 }
 
 
-Result<vector<Classifier> > classifiers(
+Result<vector<Classifier>> classifiers(
     const string& link,
     const queueing::Handle& parent)
 {

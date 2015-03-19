@@ -25,9 +25,11 @@
 #include <boost/circular_buffer.hpp>
 
 #include <mesos/mesos.hpp>
+#include <mesos/type_utils.hpp>
 
 #include <process/future.hpp>
 #include <process/limiter.hpp>
+#include <process/owned.hpp>
 #include <process/statistics.hpp>
 
 #include <stout/cache.hpp>
@@ -36,8 +38,6 @@
 #include <stout/nothing.hpp>
 #include <stout/option.hpp>
 #include <stout/try.hpp>
-
-#include "common/type_utils.hpp"
 
 namespace mesos {
 namespace internal {
@@ -177,7 +177,7 @@ private:
   hashmap<ContainerID, MonitoringInfo> monitored;
 
   // Fixed-size history of monitoring information.
-  boost::circular_buffer<MonitoringInfo> archive;
+  boost::circular_buffer<process::Owned<MonitoringInfo>> archive;
 };
 
 } // namespace slave {

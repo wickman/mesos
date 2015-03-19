@@ -31,6 +31,11 @@
 
 #include <mesos/mesos.hpp>
 #include <mesos/scheduler.hpp>
+#include <mesos/type_utils.hpp>
+
+#include <mesos/authentication/authenticatee.hpp>
+
+#include <mesos/module/authenticatee.hpp>
 
 #include <process/async.hpp>
 #include <process/defer.hpp>
@@ -46,8 +51,8 @@
 #include <stout/duration.hpp>
 #include <stout/error.hpp>
 #include <stout/flags.hpp>
+#include <stout/ip.hpp>
 #include <stout/lambda.hpp>
-#include <stout/net.hpp>
 #include <stout/nothing.hpp>
 #include <stout/option.hpp>
 #include <stout/os.hpp>
@@ -55,7 +60,6 @@
 
 #include "authentication/cram_md5/authenticatee.hpp"
 
-#include "common/type_utils.hpp"
 
 #include "master/detector.hpp"
 
@@ -126,7 +130,7 @@ public:
     // want to use flags to initialize libprocess).
     process::initialize();
 
-    if (stringify(net::IP(ntohl(self().ip))) == "127.0.0.1") {
+    if (self().address.ip.isLoopback()) {
       LOG(WARNING) << "\n**************************************************\n"
                    << "Scheduler driver bound to loopback interface!"
                    << " Cannot communicate with remote master(s)."
@@ -256,6 +260,34 @@ public:
         break;
       }
 
+      case Call::ACCEPT: {
+        if (!call.has_accept()) {
+          drop(call, "Expecting 'accept' to be present");
+          return;
+        }
+        // We do some local validation here, but really this should
+        // all happen in the master so it's only implemented once.
+        foreach (Offer::Operation& operation,
+                 *call.mutable_accept()->mutable_operations()) {
+          if (operation.type() != Offer::Operation::LAUNCH) {
+            continue;
+          }
+
+          foreach (TaskInfo& task,
+                   *operation.mutable_launch()->mutable_task_infos()) {
+            // Set ExecutorInfo::framework_id if missing since this
+            // field was added to the API later and thus was made
+            // optional.
+            if (task.has_executor() && !task.executor().has_framework_id()) {
+              task.mutable_executor()->mutable_framework_id()->CopyFrom(
+                  call.framework_info().id());
+            }
+          }
+        }
+        send(master.get(), call);
+        break;
+      }
+
       case Call::REVIVE: {
         ReviveOffersMessage message;
         message.mutable_framework_id()->CopyFrom(call.framework_info().id());
@@ -270,35 +302,13 @@ public:
         }
         // We do some local validation here, but really this should
         // all happen in the master so it's only implemented once.
-        vector<TaskInfo> tasks;
-
-        foreach (const TaskInfo& task, call.launch().task_infos()) {
-          // Check that each TaskInfo has either an ExecutorInfo or a
-          // CommandInfo but not both.
-          if (task.has_executor() == task.has_command()) {
-            drop(task,
-                 "TaskInfo must have either an 'executor' or a 'command'");
-            continue;
-          }
-
-          // Ensure ExecutorInfo::framework_id is valid, if present.
-          if (task.has_executor() &&
-              task.executor().has_framework_id() &&
-              !(task.executor().framework_id() == call.framework_info().id())) {
-            drop(task,
-                 "ExecutorInfo has an invalid FrameworkID (Actual: " +
-                 stringify(task.executor().framework_id()) + " vs Expected: " +
-                 stringify(call.framework_info().id()) + ")");
-            continue;
-          }
-
-          tasks.push_back(task);
-
+        foreach (TaskInfo& task,
+                 *call.mutable_launch()->mutable_task_infos()) {
           // Set ExecutorInfo::framework_id if missing since this
           // field was added to the API later and thus was made
           // optional.
           if (task.has_executor() && !task.executor().has_framework_id()) {
-            tasks.back().mutable_executor()->mutable_framework_id()->CopyFrom(
+            task.mutable_executor()->mutable_framework_id()->CopyFrom(
                 call.framework_info().id());
           }
         }
@@ -307,11 +317,7 @@ public:
         message.mutable_framework_id()->CopyFrom(call.framework_info().id());
         message.mutable_filters()->CopyFrom(call.launch().filters());
         message.mutable_offer_ids()->CopyFrom(call.launch().offer_ids());
-
-        foreach (const TaskInfo& task, tasks) {
-          message.add_tasks()->CopyFrom(task);
-        }
-
+        message.mutable_tasks()->CopyFrom(call.launch().task_infos());
         send(master.get(), message);
         break;
       }
@@ -465,7 +471,7 @@ protected:
     CHECK_SOME(credential);
 
     CHECK(authenticatee == NULL);
-    authenticatee = new cram_md5::Authenticatee(credential.get(), self());
+    authenticatee = new cram_md5::CRAMMD5Authenticatee();
 
     // NOTE: We do not pass 'Owned<Authenticatee>' here because doing
     // so could make 'AuthenticateeProcess' responsible for deleting
@@ -480,8 +486,9 @@ protected:
     //     'Authenticatee'.
     // --> '~Authenticatee()' is invoked by 'AuthenticateeProcess'.
     // TODO(vinod): Consider using 'Shared' to 'Owned' upgrade.
-    authenticating = authenticatee->authenticate(master.get())
-      .onAny(defer(self(), &Self::_authenticate));
+    authenticating =
+      authenticatee->authenticate(master.get(), self(), credential.get())
+        .onAny(defer(self(), &Self::_authenticate));
 
     delay(Seconds(5),
           self(),
@@ -683,6 +690,7 @@ protected:
     update->mutable_status()->set_timestamp(message.update().timestamp());
 
     update->set_uuid(message.update().uuid());
+    update->mutable_status()->set_uuid(message.update().uuid());
 
     receive(from, event);
   }
@@ -755,6 +763,7 @@ protected:
     status->set_timestamp(Clock::now().secs());
 
     update->set_uuid(UUID::random().toBytes());
+    status->set_uuid(update->uuid());
 
     receive(None(), event);
   }
@@ -808,7 +817,7 @@ private:
 
   Option<UPID> master;
 
-  cram_md5::Authenticatee* authenticatee;
+  Authenticatee* authenticatee;
 
   // Indicates if an authentication attempt is in progress.
   Option<Future<bool> > authenticating;

@@ -18,12 +18,13 @@
 # Process this file with autoconf to produce a configure script.
 
 AC_PREREQ([2.61])
-AC_INIT([mesos], [0.21.1])
+AC_INIT([mesos], [0.23.0])
 
 # Have autoconf setup some variables related to the system.
 AC_CANONICAL_HOST
 AC_CANONICAL_BUILD
 AC_CANONICAL_TARGET
+AC_DISABLE_STATIC
 
 AC_LANG([C++])
 

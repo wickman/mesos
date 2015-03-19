@@ -22,7 +22,7 @@
 #include <string>
 #include <vector>
 
-#include <stout/net.hpp>
+#include <stout/ip.hpp>
 #include <stout/option.hpp>
 #include <stout/result.hpp>
 #include <stout/try.hpp>
@@ -51,6 +51,8 @@ public:
   const Option<net::IP>& destinationIP() const { return destinationIP_; }
 
 private:
+  // TODO(evelinad): Replace net::IP with net::IPNetwork when we will
+  // support classifiers for the entire subnet.
   Option<net::IP> destinationIP_;
 };
 
@@ -114,7 +116,7 @@ Try<bool> update(
 // Returns the classifiers of all the ICMP packet filters attached to
 // the given parent on the link. Returns None if the link or the
 // parent is not found.
-Result<std::vector<Classifier> > classifiers(
+Result<std::vector<Classifier>> classifiers(
     const std::string& link,
     const queueing::Handle& parent);
 

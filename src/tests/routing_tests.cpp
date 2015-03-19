@@ -32,6 +32,8 @@
 #include <stout/foreach.hpp>
 #include <stout/gtest.hpp>
 #include <stout/hashmap.hpp>
+#include <stout/ip.hpp>
+#include <stout/mac.hpp>
 #include <stout/net.hpp>
 #include <stout/stringify.hpp>
 
@@ -46,6 +48,7 @@
 
 #include "linux/routing/link/link.hpp"
 
+#include "linux/routing/queueing/fq_codel.hpp"
 #include "linux/routing/queueing/handle.hpp"
 #include "linux/routing/queueing/ingress.hpp"
 
@@ -59,6 +62,10 @@ using std::endl;
 using std::set;
 using std::string;
 using std::vector;
+
+namespace mesos {
+namespace internal {
+namespace tests {
 
 
 static const string TEST_VETH_LINK = "veth-test";
@@ -404,6 +411,18 @@ TEST_F(RoutingVethTest, ROOT_LinkMTU)
 
   EXPECT_NONE(link::mtu("not-exist"));
   EXPECT_SOME_FALSE(link::setMTU("not-exist", 1500));
+}
+
+
+TEST_F(RoutingVethTest, ROOT_FqCodelCreate)
+{
+  ASSERT_SOME(link::create(TEST_VETH_LINK, TEST_PEER_LINK, None()));
+
+  EXPECT_SOME_TRUE(link::exists(TEST_VETH_LINK));
+  EXPECT_SOME_TRUE(link::exists(TEST_PEER_LINK));
+
+  ASSERT_SOME_TRUE(fq_codel::create(TEST_VETH_LINK));
+  EXPECT_SOME_TRUE(fq_codel::exists(TEST_VETH_LINK));
 }
 
 
@@ -1085,3 +1104,7 @@ TEST_F(RoutingVethTest, ROOT_HandleGeneration)
   // will find the handle matches the first filter.
   EXPECT_SOME_TRUE(ip::remove(TEST_VETH_LINK, ingress::HANDLE, classifier2));
 }
+
+} // namespace tests {
+} // namespace internal {
+} // namespace mesos {

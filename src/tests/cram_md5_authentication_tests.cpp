@@ -16,8 +16,13 @@
  * limitations under the License.
  */
 
-#include <map>
 #include <string>
+
+#include <mesos/authentication/authenticatee.hpp>
+#include <mesos/authentication/authenticator.hpp>
+
+#include <mesos/module/authenticatee.hpp>
+#include <mesos/module/authenticator.hpp>
 
 #include <process/gmock.hpp>
 #include <process/gtest.hpp>
@@ -30,12 +35,12 @@
 #include "authentication/cram_md5/authenticator.hpp"
 
 #include "tests/mesos.hpp"
+#include "tests/module.hpp"
 
 using namespace mesos::internal::tests;
 
 using namespace process;
 
-using std::map;
 using std::string;
 
 using testing::_;
@@ -45,7 +50,35 @@ namespace mesos {
 namespace internal {
 namespace cram_md5 {
 
-TEST(CRAMMD5Authentication, success)
+template <typename T>
+class CRAMMD5Authentication : public MesosTest {};
+
+template <typename T, typename U>
+class Authentication
+{
+public:
+  typedef T TypeAuthenticatee;
+  typedef U TypeAuthenticator;
+};
+
+// Test all authentication variants against each other.
+// default authenticatee      <> default authenticator
+// modularized authenticatee  <> default authenticator
+// default authenticatee      <> modularized authenticator
+// modularized authenticatee  <> modularized authenticator
+typedef ::testing::Types<
+  Authentication<CRAMMD5Authenticatee, CRAMMD5Authenticator>,
+  Authentication<tests::Module<Authenticatee, TestCRAMMD5Authenticatee>,
+                 CRAMMD5Authenticator>,
+  Authentication<CRAMMD5Authenticatee,
+                 tests::Module<Authenticator, TestCRAMMD5Authenticator>>,
+  Authentication<tests::Module<Authenticatee, TestCRAMMD5Authenticatee>,
+                 tests::Module<Authenticator, TestCRAMMD5Authenticator>>>
+  AuthenticationTypes;
+
+TYPED_TEST_CASE(CRAMMD5Authentication, AuthenticationTypes);
+
+TYPED_TEST(CRAMMD5Authentication, success)
 {
   // Launch a dummy process (somebody to send the AuthenticateMessage).
   UPID pid = spawn(new ProcessBase(), true);
@@ -61,30 +94,36 @@ TEST(CRAMMD5Authentication, success)
 
   secrets::load(credentials);
 
-  Authenticatee authenticatee(credential1, UPID());
-
   Future<Message> message =
     FUTURE_MESSAGE(Eq(AuthenticateMessage().GetTypeName()), _, _);
 
-  Future<bool> client = authenticatee.authenticate(pid);
+  Try<Authenticatee*> authenticatee = TypeParam::TypeAuthenticatee::create();
+  CHECK_SOME(authenticatee);
+
+  Future<bool> client =
+    authenticatee.get()->authenticate(pid, UPID(), credential1);
 
   AWAIT_READY(message);
 
-  CRAMMD5Authenticator authenticator;
-  authenticator.initialize(message.get().from);
+  Try<Authenticator*> authenticator = TypeParam::TypeAuthenticator::create();
+  CHECK_SOME(authenticator);
 
-  Future<Option<string>> principal = authenticator.authenticate();
+  authenticator.get()->initialize(message.get().from);
+
+  Future<Option<string>> principal = authenticator.get()->authenticate();
 
   AWAIT_EQ(true, client);
   AWAIT_READY(principal);
   EXPECT_SOME_EQ("benh", principal.get());
 
   terminate(pid);
+  delete authenticator.get();
+  delete authenticatee.get();
 }
 
 
 // Bad password should return an authentication failure.
-TEST(CRAMMD5Authentication, failed1)
+TYPED_TEST(CRAMMD5Authentication, failed1)
 {
   // Launch a dummy process (somebody to send the AuthenticateMessage).
   UPID pid = spawn(new ProcessBase(), true);
@@ -100,30 +139,36 @@ TEST(CRAMMD5Authentication, failed1)
 
   secrets::load(credentials);
 
-  Authenticatee authenticatee(credential1, UPID());
-
   Future<Message> message =
     FUTURE_MESSAGE(Eq(AuthenticateMessage().GetTypeName()), _, _);
 
-  Future<bool> client = authenticatee.authenticate(pid);
+  Try<Authenticatee*> authenticatee = TypeParam::TypeAuthenticatee::create();
+  CHECK_SOME(authenticatee);
+
+  Future<bool> client =
+    authenticatee.get()->authenticate(pid, UPID(), credential1);
 
   AWAIT_READY(message);
 
-  CRAMMD5Authenticator authenticator;
-  authenticator.initialize(message.get().from);
+  Try<Authenticator*> authenticator = TypeParam::TypeAuthenticator::create();
+  CHECK_SOME(authenticator);
 
-  Future<Option<string>> server = authenticator.authenticate();
+  authenticator.get()->initialize(message.get().from);
+
+  Future<Option<string>> server = authenticator.get()->authenticate();
 
   AWAIT_EQ(false, client);
   AWAIT_READY(server);
   EXPECT_NONE(server.get());
 
   terminate(pid);
+  delete authenticator.get();
+  delete authenticatee.get();
 }
 
 
 // No user should return an authentication failure.
-TEST(CRAMMD5Authentication, failed2)
+TYPED_TEST(CRAMMD5Authentication, failed2)
 {
   // Launch a dummy process (somebody to send the AuthenticateMessage).
   UPID pid = spawn(new ProcessBase(), true);
@@ -139,32 +184,38 @@ TEST(CRAMMD5Authentication, failed2)
 
   secrets::load(credentials);
 
-  Authenticatee authenticatee(credential1, UPID());
-
   Future<Message> message =
     FUTURE_MESSAGE(Eq(AuthenticateMessage().GetTypeName()), _, _);
 
-  Future<bool> client = authenticatee.authenticate(pid);
+  Try<Authenticatee*> authenticatee = TypeParam::TypeAuthenticatee::create();
+  CHECK_SOME(authenticatee);
+
+  Future<bool> client =
+    authenticatee.get()->authenticate(pid, UPID(), credential1);
 
   AWAIT_READY(message);
 
-  CRAMMD5Authenticator authenticator;
-  authenticator.initialize(message.get().from);
+  Try<Authenticator*> authenticator = TypeParam::TypeAuthenticator::create();
+  CHECK_SOME(authenticator);
 
-  Future<Option<string>> server = authenticator.authenticate();
+  authenticator.get()->initialize(message.get().from);
+
+  Future<Option<string>> server = authenticator.get()->authenticate();
 
   AWAIT_EQ(false, client);
   AWAIT_READY(server);
   EXPECT_NONE(server.get());
 
   terminate(pid);
+  delete authenticator.get();
+  delete authenticatee.get();
 }
 
 
 // This test verifies that the pending future returned by
 // 'Authenticator::authenticate()' is properly failed when the Authenticator is
 // destructed in the middle of authentication.
-TEST(CRAMMD5Authentication, AuthenticatorDestructionRace)
+TYPED_TEST(CRAMMD5Authentication, AuthenticatorDestructionRace)
 {
   // Launch a dummy process (somebody to send the AuthenticateMessage).
   UPID pid = spawn(new ProcessBase(), true);
@@ -180,24 +231,28 @@ TEST(CRAMMD5Authentication, AuthenticatorDestructionRace)
 
   secrets::load(credentials);
 
-  Authenticatee authenticatee(credential1, UPID());
-
   Future<Message> message =
     FUTURE_MESSAGE(Eq(AuthenticateMessage().GetTypeName()), _, _);
 
-  Future<bool> client = authenticatee.authenticate(pid);
+  Try<Authenticatee*> authenticatee = TypeParam::TypeAuthenticatee::create();
+  CHECK_SOME(authenticatee);
+
+  Future<bool> client =
+    authenticatee.get()->authenticate(pid, UPID(), credential1);
 
   AWAIT_READY(message);
 
-  CRAMMD5Authenticator* authenticator = new CRAMMD5Authenticator();
-  authenticator->initialize(message.get().from);
+  Try<Authenticator*> authenticator = TypeParam::TypeAuthenticator::create();
+  CHECK_SOME(authenticator);
+
+  authenticator.get()->initialize(message.get().from);
 
   // Drop the AuthenticationStepMessage from authenticator to keep
   // the authentication from getting completed.
   Future<AuthenticationStepMessage> authenticationStepMessage =
     DROP_PROTOBUF(AuthenticationStepMessage(), _, _);
 
-  Future<Option<string>> principal = authenticator->authenticate();
+  Future<Option<string>> principal = authenticator.get()->authenticate();
 
   AWAIT_READY(authenticationStepMessage);
 
@@ -208,12 +263,13 @@ TEST(CRAMMD5Authentication, AuthenticatorDestructionRace)
   ASSERT_TRUE(principal.isPending());
 
   // Now delete the authenticator.
-  delete authenticator;
+  delete authenticator.get();
 
   // The future should be failed at this point.
   AWAIT_FAILED(principal);
 
   terminate(pid);
+  delete authenticatee.get();
 }
 
 } // namespace cram_md5 {

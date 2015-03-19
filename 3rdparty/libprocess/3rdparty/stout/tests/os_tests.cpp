@@ -138,7 +138,7 @@ TEST_F(OsTest, cloexec)
   Try<int> fd = os::open(
       "cloexec",
       O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC,
-      S_IRUSR | S_IWUSR | S_IRGRP | S_IRWXO);
+      S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 
   ASSERT_SOME(fd);
   EXPECT_SOME_TRUE(os::isCloexec(fd.get()));
@@ -148,7 +148,7 @@ TEST_F(OsTest, cloexec)
   fd = os::open(
       "non-cloexec",
       O_CREAT | O_WRONLY | O_APPEND,
-      S_IRUSR | S_IWUSR | S_IRGRP | S_IRWXO);
+      S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 
   ASSERT_SOME(fd);
   EXPECT_SOME_FALSE(os::isCloexec(fd.get()));
@@ -897,4 +897,34 @@ TEST_F(OsTest, Libraries)
   // Reset LD_LIBRARY_PATH.
   os::libraries::setPaths(originalLibraryPath);
   EXPECT_EQ(os::libraries::paths(), originalLibraryPath);
+}
+
+
+TEST_F(OsTest, Mknod)
+{
+  // mknod requires root permission.
+  Result<string> user = os::user();
+  ASSERT_SOME(user);
+
+  if (user.get() != "root") {
+    return;
+  }
+
+  const string& device = "null";
+
+  const string& existing = path::join("/dev", device);
+  ASSERT_TRUE(os::exists(existing));
+
+  Try<mode_t> mode = os::stat::mode(existing);
+  ASSERT_SOME(mode);
+
+  Try<dev_t> rdev = os::stat::rdev(existing);
+  ASSERT_SOME(rdev);
+
+  const string& another = path::join(os::getcwd(), device);
+  ASSERT_FALSE(os::exists(another));
+
+  EXPECT_SOME(os::mknod(another, mode.get(), rdev.get()));
+
+  EXPECT_SOME(os::rm(another));
 }

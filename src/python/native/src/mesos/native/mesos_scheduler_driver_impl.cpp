@@ -128,6 +128,11 @@ PyMethodDef MesosSchedulerDriverImpl_methods[] = {
     METH_VARARGS,
     "Kill the task with the given ID"
   },
+  { "acceptOffers",
+    (PyCFunction) MesosSchedulerDriverImpl_acceptOffers,
+    METH_VARARGS,
+    "Reply to a Mesos offer with a list of offer operations"
+  },
   { "declineOffer",
     (PyCFunction) MesosSchedulerDriverImpl_declineOffer,
     METH_VARARGS,
@@ -137,6 +142,11 @@ PyMethodDef MesosSchedulerDriverImpl_methods[] = {
     (PyCFunction) MesosSchedulerDriverImpl_reviveOffers,
     METH_NOARGS,
     "Remove all filters and ask Mesos for new offers"
+  },
+  { "acknowledgeStatusUpdate",
+    (PyCFunction) MesosSchedulerDriverImpl_acknowledgeStatusUpdate,
+    METH_VARARGS,
+    "Acknowledge a status update"
   },
   { "sendFrameworkMessage",
     (PyCFunction) MesosSchedulerDriverImpl_sendFrameworkMessage,
@@ -178,13 +188,22 @@ int MesosSchedulerDriverImpl_init(MesosSchedulerDriverImpl* self,
                                   PyObject* args,
                                   PyObject* kwds)
 {
+  // Note: We use an integer for 'implicitAcknoweldgements' because
+  // it is the recommended way to pass booleans through CPython.
   PyObject* schedulerObj = NULL;
   PyObject* frameworkObj = NULL;
   const char* master;
+  int implicitAcknowledgements;
   PyObject* credentialObj = NULL;
 
   if (!PyArg_ParseTuple(
-      args, "OOs|O", &schedulerObj, &frameworkObj, &master, &credentialObj)) {
+      args,
+      "OOs|iO",
+      &schedulerObj,
+      &frameworkObj,
+      &master,
+      &implicitAcknowledgements,
+      &credentialObj)) {
     return -1;
   }
 
@@ -227,10 +246,17 @@ int MesosSchedulerDriverImpl_init(MesosSchedulerDriverImpl* self,
 
   if (credentialObj != NULL) {
     self->driver = new MesosSchedulerDriver(
-        self->proxyScheduler, framework, master, credential);
+        self->proxyScheduler,
+        framework,
+        master,
+        implicitAcknowledgements != 0,
+        credential);
   } else {
     self->driver = new MesosSchedulerDriver(
-        self->proxyScheduler, framework, master);
+        self->proxyScheduler,
+        framework,
+        master,
+        implicitAcknowledgements != 0);
   }
 
   return 0;
@@ -502,6 +528,85 @@ PyObject* MesosSchedulerDriverImpl_killTask(MesosSchedulerDriverImpl* self,
 }
 
 
+PyObject* MesosSchedulerDriverImpl_acceptOffers(MesosSchedulerDriverImpl* self,
+                                                PyObject* args)
+{
+  if (self->driver == NULL) {
+    PyErr_Format(PyExc_Exception, "MesosSchedulerDriverImpl.driver is NULL");
+    return NULL;
+  }
+
+  PyObject* offerIdsObj = NULL;
+  PyObject* operationsObj = NULL;
+  PyObject* filtersObj = NULL;
+  Py_ssize_t len = 0;
+  vector<OfferID> offerIds;
+  vector<Offer::Operation> operations;
+  Filters filters;
+
+  if (!PyArg_ParseTuple(args,
+                        "OO|O",
+                        &offerIdsObj,
+                        &operationsObj,
+                        &filtersObj)) {
+    return NULL;
+  }
+
+  if (!PyList_Check(offerIdsObj)) {
+    PyErr_Format(PyExc_Exception, "Parameter 1 to acceptOffers is not a list");
+    return NULL;
+  }
+
+  len = PyList_Size(offerIdsObj);
+  for (int i = 0; i < len; i++) {
+    PyObject* offerObj = PyList_GetItem(offerIdsObj, i);
+    if (offerObj == NULL) {
+      return NULL;
+    }
+
+    OfferID offerId;
+    if (!readPythonProtobuf(offerObj, &offerId)) {
+      PyErr_Format(PyExc_Exception,
+                   "Could not deserialize Python OfferID");
+      return NULL;
+    }
+    offerIds.push_back(offerId);
+  }
+
+  if (!PyList_Check(operationsObj)) {
+    PyErr_Format(PyExc_Exception, "Parameter 2 to acceptOffers is not a list");
+    return NULL;
+  }
+
+  len = PyList_Size(operationsObj);
+  for (int i = 0; i < len; i++) {
+    PyObject* operationObj = PyList_GetItem(operationsObj, i);
+    if (operationObj == NULL) {
+      return NULL; // Exception will have been set by PyList_GetItem.
+    }
+
+    Offer::Operation operation;
+    if (!readPythonProtobuf(operationObj, &operation)) {
+      PyErr_Format(PyExc_Exception,
+                   "Could not deserialize Python Offer.Operation");
+      return NULL;
+    }
+    operations.push_back(operation);
+  }
+
+  if (filtersObj != NULL) {
+    if (!readPythonProtobuf(filtersObj, &filters)) {
+      PyErr_Format(PyExc_Exception,
+                   "Could not deserialize Python Filters");
+      return NULL;
+    }
+  }
+
+  Status status = self->driver->acceptOffers(offerIds, operations, filters);
+  return PyInt_FromLong(status); // Sets exception if creating long fails.
+}
+
+
 PyObject* MesosSchedulerDriverImpl_declineOffer(MesosSchedulerDriverImpl* self,
                                                 PyObject* args)
 {
@@ -545,6 +650,33 @@ PyObject* MesosSchedulerDriverImpl_reviveOffers(MesosSchedulerDriverImpl* self)
   }
 
   Status status = self->driver->reviveOffers();
+  return PyInt_FromLong(status); // Sets exception if creating long fails.
+}
+
+
+PyObject* MesosSchedulerDriverImpl_acknowledgeStatusUpdate(
+    MesosSchedulerDriverImpl* self,
+    PyObject* args)
+{
+  if (self->driver == NULL) {
+    PyErr_Format(PyExc_Exception, "MesosSchedulerDriverImpl.driver is NULL");
+    return NULL;
+  }
+
+  PyObject* taskStatusObj = NULL;
+  TaskStatus taskStatus;
+
+  if (!PyArg_ParseTuple(args, "O", &taskStatusObj)) {
+    return NULL;
+  }
+
+  if (!readPythonProtobuf(taskStatusObj, &taskStatus)) {
+    PyErr_Format(PyExc_Exception, "Could not deserialize Python TaskStatus");
+    return NULL;
+  }
+
+  Status status = self->driver->acknowledgeStatusUpdate(taskStatus);
+
   return PyInt_FromLong(status); // Sets exception if creating long fails.
 }
 
